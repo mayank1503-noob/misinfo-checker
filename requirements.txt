@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+requests
+pydantic
+trafilatura
+htmldate
+pytest
+
+# claim extraction transformer backend (optional; falls back to regex without them)
+# on Windows/CPU: pip install torch --index-url https://download.pytorch.org/whl/cpu
+transformers
+torch
