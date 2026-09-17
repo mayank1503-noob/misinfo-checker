@@ -31,7 +31,6 @@ from datetime import date
 from typing import List, NamedTuple
 
 from ..evidence.schema import EvidenceCandidate
-from ..graph.store import DATE_MISMATCH_DAYS
 from . import consistency, local_index, reverse_search
 from .keyframes import MAX_IMAGES, SIMILARITY_THRESHOLD, select_keyframes
 
@@ -392,6 +391,3 @@ def _check_consistency(graph, image, image_node, claim_ids, threshold, report):
             message = f"could not set the CLIP stance: {type(error).__name__}: {error}"
             log.warning(message)
             report["errors"].append(message)
-
-
-DATE_MISMATCH_DAYS = DATE_MISMATCH_DAYS       # re-exported for callers
