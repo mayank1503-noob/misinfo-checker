@@ -11,3 +11,6 @@ cache/
 # pyvis scratch output
 lib/
 *.html
+
+# generated demo assets (rebuild: python scripts/build_image_index.py)
+data/image_index.json
