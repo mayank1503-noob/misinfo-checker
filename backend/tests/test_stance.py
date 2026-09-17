@@ -424,6 +424,172 @@ def test_mixed_rating_is_neutral_with_a_soft_score(models):
     assert result.score == 0.5
 
 
+# --- the relevance gate (DECISIONS.md O6) -----------------------------------
+
+
+def test_a_fact_check_of_a_neighbouring_claim_cannot_convict(models):
+    """
+    The O6 defect, in stage 4's own terms: a fact-check whose reviewed
+    claim is a *different* claim in the same topic. Its `False` rating
+    must not reach the claim, and the entailment model must not be asked
+    either — it does not abstain on these pairs, which is why deferring
+    to it was tried and reverted.
+    """
+    claim = {
+        "id": "clm_benign",
+        "text": "Boiling water before drinking it reduces the risk of "
+                "waterborne disease.",
+    }
+
+    item = evidence(
+        claim_id="clm_benign",
+        title="Drinking hot water every 15 minutes kills the coronavirus "
+              "before it reaches the lungs.",
+        snippet="Drinking water cannot reach the respiratory tract where the "
+                "virus replicates.",
+        rating="False",
+    )
+
+    result = classify_stance([claim], [item])[0]
+
+    assert result.stance == "neutral"
+    assert result.method == "not_about"
+    assert result.score == 0.0
+    assert result.weighted_score == 0.0
+    assert "withheld" in result.note
+    assert models.nli_calls == []
+    assert models.embed_calls == []
+
+
+def test_the_gate_does_not_touch_a_fact_check_of_the_claim_itself(models):
+    """The same rumour, retrieved for the claim it is actually about."""
+    claim = {
+        "id": "clm_rumour",
+        "text": "Drinking hot water every 15 minutes kills the coronavirus "
+                "before it reaches the lungs.",
+    }
+
+    item = evidence(
+        claim_id="clm_rumour",
+        title="Drinking hot water every 15 minutes kills the coronavirus "
+              "before it reaches the lungs.",
+        snippet="Drinking water cannot reach the respiratory tract where the "
+                "virus replicates.",
+        rating="False",
+    )
+
+    result = classify_stance([claim], [item])[0]
+
+    assert result.stance == "refute"
+    assert result.method == "rating"
+
+
+def test_an_unrated_article_is_never_gated(models):
+    """
+    Only a rating can settle a claim without anything having scored it,
+    so only a rated item is judged. An ordinary article's title is a
+    headline, not a claim under review, and gating on it would throw away
+    evidence for being briefly worded.
+    """
+    models.script = {"crossed 1.4 billion": "entailment"}
+
+    item = evidence(
+        title="Cricket board announces new schedule for the tour",
+        text="India's population crossed 1.4 billion people in 2023. "
+             "The UN confirmed the milestone. "
+             "Growth has slowed.",
+    )
+
+    result = classify_stance(CLAIMS, [item])[0]
+
+    assert result.method == "nli"
+    assert result.stance == "support"
+
+
+def test_a_rated_item_with_no_stated_claim_keeps_its_rating(models):
+    """
+    Nothing to compare is not the same as a mismatch. A fact-check that
+    arrives with no title and no snippet is judged UNCLEAR, and stage 4
+    behaves exactly as it did before the gate existed.
+    """
+    item = evidence(
+        rating="False",
+        title=None,
+        snippet=None,
+        text="India's population crossed 1.4 billion people in 2023. "
+             "We checked the figures. "
+             "The claim is false.",
+    )
+
+    result = classify_stance(CLAIMS, [item])[0]
+
+    assert result.method == "rating"
+    assert result.stance == "refute"
+
+
+def test_a_hinglish_claim_is_not_gated_against_an_english_fact_check(models):
+    """
+    Across languages the word overlap measures the loanwords, not the
+    claim, so the gate abstains — a wrong gate here would downgrade a
+    real rumour, which is the mistake the first O6 attempt made.
+    """
+    claim = {
+        "id": "clm_hinglish",
+        "text": "Garam paani peene se corona theek ho jata hai, WHO ne kaha hai.",
+    }
+
+    item = evidence(
+        claim_id="clm_hinglish",
+        title="Drinking hot water every 15 minutes kills the coronavirus "
+              "before it reaches the lungs.",
+        rating="False",
+    )
+
+    result = classify_stance([claim], [item])[0]
+
+    assert result.method == "rating"
+    assert result.stance == "refute"
+
+
+def test_a_gated_item_alongside_a_real_one(models):
+    """
+    The gate is per item: one claim's evidence can contain both, and the
+    good item still gets read.
+    """
+    claim = {
+        "id": "clm_benign",
+        "text": "COVID-19 vaccines were tested in clinical trials before "
+                "being approved.",
+    }
+
+    items = [
+        evidence(
+            id="ev_neighbour",
+            claim_id="clm_benign",
+            title="COVID-19 vaccines contain a microchip that tracks the "
+                  "person who received the dose.",
+            snippet="Vaccine vials are inspected and their contents published.",
+            rating="False",
+        ),
+        evidence(
+            id="ev_real",
+            claim_id="clm_benign",
+            title="COVID-19 vaccines were tested in clinical trials before "
+                  "being approved for use.",
+            text="Every approved COVID-19 vaccine went through phase three "
+                 "clinical trials. The trial data was published. "
+                 "Regulators reviewed it before approval.",
+            rating="True",
+        ),
+    ]
+
+    by_id = {result.evidence_id: result for result in classify_stance([claim], items)}
+
+    assert by_id["ev_neighbour"].method == "not_about"
+    assert by_id["ev_real"].method == "rating"
+    assert by_id["ev_real"].stance == "support"
+
+
 def test_rating_still_applies_when_the_text_is_off_topic(models):
     item = evidence(rating="False", text="Cricket tickets go on sale next week.")
 

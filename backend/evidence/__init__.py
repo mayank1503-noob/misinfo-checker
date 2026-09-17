@@ -17,6 +17,7 @@ network retrievers log once and return nothing when their key is unset.
 from .collector import CollectionReport, collect_evidence, retrieve_for_claim
 from .normalize import normalize_candidates, normalize_rating, tier_for, weight_for
 from .queries import Query, build_queries, queries_for
+from .translit import devanagari, looks_romanised
 from .schema import (
     RATINGS,
     SOURCE_TYPES,
@@ -34,6 +35,8 @@ __all__ = [
     "Query",
     "build_queries",
     "queries_for",
+    "devanagari",
+    "looks_romanised",
     "normalize_candidates",
     "normalize_rating",
     "tier_for",

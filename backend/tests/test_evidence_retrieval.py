@@ -361,6 +361,44 @@ def test_decisive_requires_a_close_fact_check_that_refutes():
     assert far.decisive is False
 
 
+def test_decisive_is_never_set_for_a_fact_check_of_a_neighbouring_claim():
+    """
+    DECISIONS.md O6. The claim here is benign; the fact-check is a real
+    refutation from a real fact-checker — of the rumour the claim sits
+    beside in embedding space, not of the claim.
+
+    `overlap` is passed in above the floor deliberately, so that the
+    wording test is satisfied and the aboutness gate is the only thing
+    left that can refuse. Without it this would be a test that passes for
+    the wrong reason: the benign claims O6 is about score 0.33-0.44,
+    which is *under* `DECISIVE_OVERLAP` by a margin too small to rely on.
+    """
+    benign = "You should never share your UPI PIN with anyone, including bank staff."
+
+    [item] = normalize_candidates(
+        [candidate(
+            title="You must enter your UPI PIN to receive the refund credited "
+                  "to your account.",
+            snippet="A PIN is never needed to receive money; entering one "
+                    "authorises a payment out.",
+        )],
+        claim_text=benign,
+    )
+
+    assert item.rating == "false"
+    assert item.source_weight == 1.0
+    assert item.meta["aboutness"] == "not_about"
+    assert item.decisive is False
+
+    assert normalize.is_decisive(item, benign, overlap=1.0) is False
+
+    # and the same item, judged against the claim it really reviews, is
+    # decisive again — the gate refuses this pairing, not this article
+    rumour = "You must enter your UPI PIN to receive the refund credited to your account."
+
+    assert normalize.is_decisive(item, rumour, overlap=1.0) is True
+
+
 def test_decisive_is_never_set_for_a_plain_web_result_or_a_true_rating():
     [web_hit] = normalize_candidates(
         [candidate(source_type="web", rating_raw=None)], claim_text=SCAM_TEXT
@@ -554,6 +592,26 @@ SEED_ROWS = [
         "demo": True,
         "demo_note": "DEMO DATA - synthetic record.",
     },
+    {
+        # Carries a Hindi phrasing, which is what a romanised query has
+        # to be transliterated into before it can match.
+        "id": "seed_hot_water",
+        "claim": "Drinking hot water every 15 minutes kills the coronavirus.",
+        "claim_hi": (
+            "गरम पानी पीने "
+            "से कोरोना ठीक "
+            "हो जाता है"
+        ),
+        "rating": "false",
+        "rating_raw": "False",
+        "publisher": "Demo Fact Check Archive",
+        "url": "https://example-demo.invalid/factcheck/hot-water",
+        "published_date": "2020-04-02",
+        "summary": "Hot water does not kill the virus.",
+        "topics": ["covid", "health"],
+        "demo": True,
+        "demo_note": "DEMO DATA - synthetic record.",
+    },
 ]
 
 
@@ -667,6 +725,131 @@ def test_seed_index_survives_a_malformed_line(tmp_path, monkeypatch, stub_embedd
     assert len(seed_index.load_entries(str(path))) == 2
 
     seed_index.reset()
+
+
+def test_a_romanised_hindi_query_reaches_the_hindi_phrasing(
+    seed_corpus, stub_embedder
+):
+    """
+    The point of backend/evidence/translit.py, at the retriever level.
+
+    The stub embedder is a bag of words, so "garam paani" shares nothing
+    with the Devanagari phrasing until it is transliterated — which makes
+    this the same before/after the real multilingual model shows, without
+    needing the model.
+    """
+    results = seed_index.search(
+        "clm_1", "garam paani peene se corona theek ho jata hai", floor=0.3
+    )
+
+    assert [r.meta["seed_id"] for r in results][:1] == ["seed_hot_water"]
+
+
+def test_both_backends_agree_on_a_romanised_query(
+    seed_corpus, stub_embedder, monkeypatch
+):
+    """
+    FAISS merges two result sets; NumPy takes a row-wise max. Different
+    code, and it has to reach the same entry with the same score.
+    """
+    import builtins
+
+    query = "garam paani peene se corona theek ho jata hai"
+
+    with_faiss = seed_index.search("clm_1", query, floor=0.3)
+
+    real_import = builtins.__import__
+
+    def no_faiss(name, *args, **kwargs):
+        if name == "faiss":
+            raise ImportError("no faiss")
+
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_faiss)
+    seed_index.reset()
+
+    with_numpy = seed_index.search("clm_1", query, floor=0.3)
+
+    assert with_numpy[0].meta["backend"] == "numpy"
+    assert [r.meta["seed_id"] for r in with_faiss] == [
+        r.meta["seed_id"] for r in with_numpy
+    ]
+    assert with_faiss[0].score == pytest.approx(with_numpy[0].score, abs=1e-5)
+
+
+def test_the_transliterated_spelling_is_recorded_on_the_candidate(
+    seed_corpus, stub_embedder
+):
+    """A reviewer has to be able to see what was actually searched for."""
+    results = seed_index.search(
+        "clm_1", "garam paani peene se corona theek ho jata hai", floor=0.3
+    )
+
+    assert results
+    assert "पानी" in results[0].meta["query_devanagari"]
+    # The candidate still reports the query the user actually sent.
+    assert results[0].query.startswith("garam paani")
+
+
+def test_an_english_query_is_embedded_once_and_unchanged(seed_corpus, monkeypatch):
+    """
+    The no-regression guarantee, asserted rather than asserted-to.
+
+    An English query must produce exactly one vector: if it only ever
+    embeds one spelling, its score cannot have moved.
+    """
+    seen = []
+
+    def embed(texts):
+        texts = list(texts)
+        seen.append(texts)
+
+        return [[float(len(t)), 1.0] for t in texts]
+
+    monkeypatch.setattr("backend.stance.rank.embed", embed)
+    monkeypatch.setattr("backend.stance.rank.available", lambda: True)
+    seed_index.reset()
+
+    seed_index.search("clm_1", "SBI cashback forward message", floor=0.0)
+
+    assert seen[-1] == ["SBI cashback forward message"]
+
+    seed_index.reset()
+
+
+def test_a_romanised_query_is_embedded_as_both_spellings(seed_corpus, monkeypatch):
+    seen = []
+
+    def embed(texts):
+        texts = list(texts)
+        seen.append(texts)
+
+        return [[float(len(t)), 1.0] for t in texts]
+
+    monkeypatch.setattr("backend.stance.rank.embed", embed)
+    monkeypatch.setattr("backend.stance.rank.available", lambda: True)
+    seed_index.reset()
+
+    seed_index.search("clm_1", "garam paani peene se corona theek hai", floor=0.0)
+
+    assert len(seen[-1]) == 2
+    assert seen[-1][0] == "garam paani peene se corona theek hai"
+
+    seed_index.reset()
+
+
+def test_no_entry_is_returned_twice_when_both_spellings_match(
+    seed_corpus, stub_embedder
+):
+    """Two query vectors, one row per entry — the merge keeps the best."""
+    results = seed_index.search(
+        "clm_1", "garam paani peene se corona theek ho jata hai", top_k=3, floor=0.0
+    )
+
+    ids = [r.meta["seed_id"] for r in results]
+
+    assert len(ids) == len(set(ids))
 
 
 def test_the_shipped_corpus_is_well_formed_and_marked_demo():

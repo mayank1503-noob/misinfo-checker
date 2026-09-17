@@ -19,6 +19,17 @@ Before any of it can be weighed together it has to be normalised:
 verdict may act on alone — a fact-checker whose rating is `false` or
 `misleading` *and* whose text overlaps the claim enough that it is
 plainly about the same thing. Everything else has to win on weight.
+
+The overlap test here is one-directional (how much of the claim the
+article repeats) and reads the whole article, which is enough to keep an
+unrelated page out but not enough to tell one rumour from its neighbour:
+the benign "boiling water reduces waterborne disease" scores 0.44
+against the hot-water-cures-COVID debunk, a hair under the 0.45 floor
+(DECISIONS.md O6). So `backend.aboutness` is asked as well, and a
+fact-check that reviews a *different* claim in the same topic cannot be
+decisive however its wording scores. Stage 4 applies the same gate to
+the rating itself; this is the half of it that keeps the verdict's
+first rule from firing.
 """
 
 import functools
@@ -26,6 +37,7 @@ import logging
 import os
 import re
 
+from .. import aboutness
 from .schema import RATINGS, canonical_url, domain_of
 
 
@@ -209,13 +221,34 @@ def claim_overlap(claim_text, candidate):
     return round(len(claim_tokens & candidate_tokens) / len(claim_tokens), 4)
 
 
-def is_decisive(candidate, claim_text, overlap=None):
+def about_the_claim(candidate, claim_text):
+    """
+    `backend.aboutness`'s answer for this candidate, as a plain string.
+
+    Both the fields a retriever might put the claim under review in are
+    offered; see `aboutness.judge_any`.
+    """
+    try:
+        return aboutness.judge_any(
+            claim_text, candidate.title, candidate.snippet
+        ).answer
+    except Exception as error:                       # fail soft, never raise
+        log.warning("aboutness failed (%s): %s", type(error).__name__, error)
+
+        return aboutness.UNCLEAR
+
+
+def is_decisive(candidate, claim_text, overlap=None, about=None):
     """
     Whether this candidate can settle the claim on its own.
 
-    Three conditions, all required: it is a fact-check, its publisher
-    rated the claim `false` or `misleading`, and its text is close enough
-    to the claim that the rating is plainly about *this* claim.
+    Four conditions, all required: it is a fact-check, its publisher
+    rated the claim `false` or `misleading`, its text is close enough to
+    the claim that the rating is plainly about *this* claim, and the
+    claim it says it reviews is not a different claim in the same topic.
+
+    `overlap` and `about` are accepted already-computed, because
+    `normalize_candidates` records both on the candidate anyway.
     """
     if candidate.source_type not in ("factcheck", "seed_index"):
         return False
@@ -229,7 +262,13 @@ def is_decisive(candidate, claim_text, overlap=None):
     if overlap is None:
         overlap = claim_overlap(claim_text, candidate)
 
-    return overlap >= DECISIVE_OVERLAP
+    if overlap < DECISIVE_OVERLAP:
+        return False
+
+    if about is None:
+        about = about_the_claim(candidate, claim_text)
+
+    return about != aboutness.NOT_ABOUT
 
 
 def _richness(candidate):
@@ -342,7 +381,11 @@ def normalize_candidates(candidates, claim_text="", cap=MAX_PER_CLAIM):
     for candidate in unique:
         overlap = claim_overlap(claim_text, candidate)
         candidate.meta["claim_overlap"] = overlap
-        candidate.decisive = is_decisive(candidate, claim_text, overlap=overlap)
+        about = about_the_claim(candidate, claim_text)
+        candidate.meta["aboutness"] = about
+        candidate.decisive = is_decisive(
+            candidate, claim_text, overlap=overlap, about=about
+        )
 
     unique.sort(key=rank_key)
 

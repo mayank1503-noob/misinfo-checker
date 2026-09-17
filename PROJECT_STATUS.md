@@ -145,7 +145,30 @@ and `STANCE_TESTS_WITH_MODELS=1`.
 - `backend/analyzers/models.py` loads BLIP through the `image-text-to-text` pipeline
   task; that checkpoint is normally loaded with `image-to-text`. Untested here — the
   image tests supply descriptions directly.
-- `backend/evaluation/` is still empty. The samples now have content, so a harness that
-  asserts expected labels per sample is the obvious next piece.
-- Romanised Hinglish retrieval, and stage 2 scoring personal chat as check-worthy. See
-  DECISIONS.md, open issues.
+- `backend/evaluation/` is built: 41 labelled cases in `data/eval_cases.jsonl`, a runner
+  with three modes (`claims` / `retrieval` / `full`), metrics that keep wrong accusations
+  separate from missed rumours and in-corpus cases separate from out-of-corpus ones, a
+  terminal report and a `--gate` for CI. `backend/evaluation/DATA.md` states what the set
+  must contain and what its numbers are not evidence of.
+- Stage 2 still scores personal chat as check-worthy, now measured at 81.2% precision.
+  See DECISIONS.md O2.
+- **The harness found a real safety defect on its first run, and it is now fixed
+  (DECISIONS.md O6):** three true statements ("boiling water reduces waterborne
+  disease", "COVID vaccines were tested in clinical trials", "never share your UPI
+  PIN") came back `false`, because retrieval matched each to the rumour it sits beside
+  and the verdict trusted that publisher's rating. Confirmed with real NLI, so it was
+  not an artefact of running with the model off. `backend/aboutness.py` now asks whether
+  a piece of evidence is about the claim at all — lexically, against the claim the
+  fact-check says it reviews, independently of the embedding that retrieved it — and a
+  rating that fails the test is withheld. On those three plus five rumours: wrong
+  accusations 3 -> 0, rumours missed 0 -> 0, verdict accuracy 62.5% -> 100%. `--gate`
+  passes. It is deliberately silent across languages, so O6 is still unguarded for a
+  Hindi or Hinglish claim against an English fact-check.
+- Every retrieval miss is a stage 2 miss (DECISIONS.md O7). After the Hinglish work,
+  Devanagari Hindi is now the worst-served language, and the cause is claim extraction,
+  not retrieval.
+- Romanised Hinglish retrieval is fixed (`backend/evidence/translit.py`): a Hinglish
+  query is transliterated to Devanagari before embedding and the seed index scores each
+  entry on its better-matching spelling. 10/10 Hinglish claims now retrieve, up from
+  6/10, with the 0.45 floor unchanged and English/Devanagari scores identical. It costs
+  one new false match on everyday Hinglish — DECISIONS.md O1 has the numbers.

@@ -79,6 +79,31 @@ def _describe(item):
     return phrase
 
 
+def _describe_other_claim(item):
+    """
+    A fact-check that stage 4 gated as being about a different claim.
+
+    Described *without* its rating, deliberately. "Rated it false" next
+    to a claim the rating was never applied to is the O6 accusation in
+    prose rather than in a label, and a reader would take it the same
+    way.
+    """
+    publisher = item.get("publisher") or item.get("domain") or "A fact-checker"
+    title = (item.get("title") or "").strip()
+
+    phrase = f"{publisher} has checked a similar-sounding claim"
+
+    if title:
+        phrase += f" ({title[:120]})"
+
+    phrase += ", which is not this one"
+
+    if item.get("demo"):
+        phrase += "  [demo data]"
+
+    return phrase
+
+
 def _recycled_images(graph, claim_id):
     """
     Pictures behind this claim that turned out to predate the message.
@@ -201,12 +226,29 @@ def verdict_for_claim(graph, claim_id):
     elif supports > 0 and refutes > 0:
         label, confidence, side = "disputed", 0.4, None
     else:
+        # Evidence stage 4 gated: retrieved on topic, reviewing a
+        # different claim (DECISIONS.md O6). Saying so is the whole
+        # point — "nothing found" would hide that a fact-check of the
+        # neighbouring rumour is sitting right there, and the old
+        # behaviour was to convict on it.
+        gated = [item for item in evidence if item.get("method") == "not_about"]
+
+        if gated:
+            explanation = (
+                "No fact-check of this claim was found. "
+                f"{_describe_other_claim(gated[0])}."
+            )
+            reasons = [_describe_other_claim(item) for item in gated[:MAX_REASONS]]
+        elif evidence:
+            explanation = (
+                "Some related material was found, but none of it takes a side "
+                "on this claim."
+            )
+        else:
+            explanation = "Nothing was found that settles this claim either way."
+
         return _result(
-            "unverified", 0.2, totals, evidence, [],
-            "Nothing was found that settles this claim either way."
-            if not evidence else
-            "Some related material was found, but none of it takes a side on this claim.",
-            demo_only,
+            "unverified", 0.2, totals, evidence, reasons, explanation, demo_only,
         )
 
     if side:

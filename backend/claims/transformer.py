@@ -75,21 +75,38 @@ def available():
 def ner_pipeline():
     from transformers import pipeline
 
-    return pipeline(
+    return _prepared(pipeline(
         "token-classification",
         model=os.getenv("CLAIM_NER_MODEL", DEFAULT_NER_MODEL),
         aggregation_strategy="first",
-    )
+    ))
 
 
 @lru_cache
 def zsc_pipeline():
     from transformers import pipeline
 
-    return pipeline(
-        "zero-shot-classification",
-        model=os.getenv("CLAIM_ZSC_MODEL", DEFAULT_ZSC_MODEL),
+    return _prepared(
+        pipeline(
+            "zero-shot-classification",
+            model=os.getenv("CLAIM_ZSC_MODEL", DEFAULT_ZSC_MODEL),
+        )
     )
+
+
+def _prepared(built):
+    """
+    Put a pipeline's weights in eval mode once, on load.
+
+    Stage 4 borrows this pipeline's model directly (backend/stance/nli.py),
+    so doing it here means both stages share one module in one state
+    rather than each toggling it.
+    """
+    from ..torch_runtime import prepare
+
+    prepare(getattr(built, "model", None))
+
+    return built
 
 
 def ner_entities(sentence):

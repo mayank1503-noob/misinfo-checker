@@ -20,6 +20,7 @@ a refutation even when the four around it are neutral filler.
 from functools import lru_cache
 
 from ..claims import transformer as claims_transformer
+from ..torch_runtime import inference, prepare
 
 
 LABELS = ("entailment", "neutral", "contradiction")
@@ -69,7 +70,7 @@ def nli_model():
         for index, label in pipeline.model.config.id2label.items()
     }
 
-    return pipeline.model, pipeline.tokenizer, id2label
+    return prepare(pipeline.model), pipeline.tokenizer, id2label
 
 
 def score_pairs(premises, hypothesis, batch_size=BATCH_SIZE):
@@ -82,8 +83,6 @@ def score_pairs(premises, hypothesis, batch_size=BATCH_SIZE):
 
     if not premises:
         return []
-
-    import torch
 
     model, tokenizer, id2label = nli_model()
 
@@ -101,7 +100,7 @@ def score_pairs(premises, hypothesis, batch_size=BATCH_SIZE):
             max_length=MAX_LENGTH,
         )
 
-        with torch.no_grad():
+        with inference():
             logits = model(**encoded).logits
 
         for row in logits.softmax(dim=-1).tolist():

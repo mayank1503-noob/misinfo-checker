@@ -13,6 +13,13 @@ wants the claims, the evidence and the graph. Nobody is forced to parse
 what they do not need, and `?graph=true` is opt-in because a serialised
 graph is large.
 
+`?agentic=true` runs the same stages through `backend.agents` instead of
+the fixed pipeline order, and adds an `agents` block (the plan, each
+agent's structured result, the tool trace) plus `explanation`. Everything
+else in the response is identical, which is the point: a caller opts into
+the agent layer for the trace and the second retrieval round, not because
+its own parsing has to change.
+
 Failures inside the pipeline are not HTTP failures. A dead retriever or a
 missing model produces `unverified` with an explanation, which is a
 useful answer; only a genuinely unreadable request is a 4xx.
@@ -25,6 +32,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from ..pipeline import analyze, analyze_image, analyze_link, analyze_text, analyze_video
+from .shape import respond
 
 
 log = logging.getLogger(__name__)
@@ -57,48 +65,10 @@ class MediaRequest(BaseModel):
     caption: str = ""
 
 
-def _respond(result, include_graph=False):
-    """
-    Shape one pipeline result for the wire.
-
-    `results` is the per-claim list the old API always returned empty.
-    """
-    verdict = result["verdict"]
-
-    return {
-        "verdict": {
-            "label": verdict["label"],
-            "confidence": verdict["confidence"],
-            "summary": verdict["summary"],
-            "counts": verdict.get("counts", {}),
-        },
-        "results": [
-            {
-                "claim": claim.get("claim"),
-                "claim_id": claim.get("claim_id"),
-                "label": claim["label"],
-                "confidence": claim["confidence"],
-                "explanation": claim["explanation"],
-                "reasons": claim.get("reasons", []),
-                "evidence_ids": claim.get("evidence_ids", []),
-                "demo_only": claim.get("demo_only", False),
-            }
-            for claim in verdict.get("claims", [])
-        ],
-        "packet": result["packet"],
-        "claims": result["claims"],
-        "timeline": result.get("timeline", []),
-        "open_claims": result.get("open_claims", []),
-        "stages": result["stages"],
-        "ms": result["ms"],
-        **({"graph": result["graph"]} if include_graph else {}),
-    }
-
-
-def _run(function, *args, graph=False, **kwargs):
+def _run(function, *args, graph=False, agentic=False, **kwargs):
     """Call a pipeline entry point, turning only real failures into 5xx."""
     try:
-        result = function(*args, graph_json=graph, **kwargs)
+        result = function(*args, graph_json=graph, agentic=agentic, **kwargs)
     except Exception as error:
         log.exception("pipeline failed")
 
@@ -106,7 +76,7 @@ def _run(function, *args, graph=False, **kwargs):
             status_code=500, detail=f"Analysis failed: {error}"
         ) from error
 
-    return _respond(result, include_graph=graph)
+    return respond(result, include_graph=graph)
 
 
 @app.get("/health")
@@ -132,7 +102,8 @@ def health():
 
 
 @app.post("/check/text")
-def check_text(request: TextRequest, graph: bool = Query(False)):
+def check_text(request: TextRequest, graph: bool = Query(False),
+               agentic: bool = Query(False)):
     text = request.text.strip()
 
     if not text:
@@ -144,11 +115,12 @@ def check_text(request: TextRequest, graph: bool = Query(False)):
             detail=f"Text is too long. Maximum length is {MAX_TEXT:,} characters.",
         )
 
-    return _run(analyze_text, text, graph=graph)
+    return _run(analyze_text, text, graph=graph, agentic=agentic)
 
 
 @app.post("/check/link")
-def check_link(request: LinkRequest, graph: bool = Query(False)):
+def check_link(request: LinkRequest, graph: bool = Query(False),
+               agentic: bool = Query(False)):
     url = request.url.strip()
 
     if not url:
@@ -159,11 +131,12 @@ def check_link(request: LinkRequest, graph: bool = Query(False)):
             status_code=422, detail="URL must start with http:// or https://"
         )
 
-    return _run(analyze_link, url, graph=graph)
+    return _run(analyze_link, url, graph=graph, agentic=agentic)
 
 
 @app.post("/check/image")
-def check_image(request: MediaRequest, graph: bool = Query(False)):
+def check_image(request: MediaRequest, graph: bool = Query(False),
+                agentic: bool = Query(False)):
     """
     Check an image already on disk.
 
@@ -179,11 +152,12 @@ def check_image(request: MediaRequest, graph: bool = Query(False)):
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail=f"No such file: {path}")
 
-    return _run(analyze_image, path, request.caption, graph=graph)
+    return _run(analyze_image, path, request.caption, graph=graph, agentic=agentic)
 
 
 @app.post("/check/video")
-def check_video(request: MediaRequest, graph: bool = Query(False)):
+def check_video(request: MediaRequest, graph: bool = Query(False),
+                agentic: bool = Query(False)):
     """Check a video: transcript plus deduplicated keyframes."""
     path = request.path.strip()
 
@@ -193,11 +167,12 @@ def check_video(request: MediaRequest, graph: bool = Query(False)):
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail=f"No such file: {path}")
 
-    return _run(analyze_video, path, request.caption, graph=graph)
+    return _run(analyze_video, path, request.caption, graph=graph, agentic=agentic)
 
 
 @app.post("/check/packet")
-def check_packet(packet: dict, graph: bool = Query(False)):
+def check_packet(packet: dict, graph: bool = Query(False),
+                 agentic: bool = Query(False)):
     """
     Check an already-built packet.
 
@@ -209,4 +184,10 @@ def check_packet(packet: dict, graph: bool = Query(False)):
             status_code=422, detail="A packet needs at least an input_type"
         )
 
-    return _run(analyze, packet, graph=graph)
+    # Temp-path bookkeeping is ours, never the client's: a packet posted
+    # with one would otherwise name directories for us to delete.
+    from ..analyzers.packet import TEMP_PATHS
+
+    packet.pop(TEMP_PATHS, None)
+
+    return _run(analyze, packet, graph=graph, agentic=agentic)

@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 python-multipart
+flask                                    # backend/api/flask_app.py: serves the frontend and takes uploads
 python-dotenv
 requests
 pydantic

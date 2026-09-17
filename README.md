@@ -285,6 +285,31 @@ floor. Being multilingual, a Devanagari claim matches an English entry: measured
 and the SBI cashback forward matches its entry at 0.82 while unrelated personal chat
 matches nothing. FAISS is optional; without it the same vectors are compared with NumPy.
 
+### Romanised Hindi (`translit.py`)
+
+The embedder reads Devanagari and English; it does not read the Latin-script Hindi that
+most WhatsApp forwards are actually written in. So a query is offered to `translit.py`
+before it is embedded, and when — and only when — it really looks like romanised Hindi,
+a Devanagari rewriting comes back. The seed index then embeds both spellings and scores
+each entry on whichever matches it better.
+
+    garam paani peene se corona theek ho jata hai
+    → गरम पानी पीने से कोरोना ठीक हो जाता है        0.32 → 0.52 against the debunk
+
+The mapping is a ~330-word lexicon keyed by a folded spelling (`paani`/`pani`,
+`theek`/`thik`, `zaroor`/`jaroor` all collapse to one key), not a transliteration scheme
+like ITRANS — those are lossless and expect `paanii`, which nobody types. A lexicon can
+only ever change words it has been told about, which is what a retrieval-critical
+component needs: there is no rule engine that can quietly mangle an English sentence.
+
+Three-way split decides what opens the gate. Native Hindi (`HINDI`) counts; English
+loanwords Hindi has absorbed (`LOANWORDS`: bank, laptop, doctor) and Hindi words spelled
+like English ones (`AMBIGUOUS`: "to", "the", "me") are rewritten once it is open but
+never help open it — otherwise "Please send me the meeting notes" would read as Hindi.
+An English or Devanagari query gets one spelling and one vector, so **its score is
+arithmetically identical to what it was before this module existed**, and the 0.45 floor
+never moved.
+
 **All 32 entries are demo data.** Each carries `"demo": true` and a `demo_note`, their
 URLs point at `example-demo.invalid`, matches stay marked `demo` all the way through, and
 a verdict resting only on them says so and is discounted.
@@ -311,7 +336,29 @@ snippet.
 ## Stage 4 — Stance
 
 `backend/stance/` decides what each retrieved item *says about* the claim it was
-retrieved for. Documents are chunked into 2–3 sentence passages, ranked against the claim
+retrieved for.
+
+First it asks a question retrieval does not answer — **is this evidence about this claim
+at all?**
+
+```
+claim -> retrieve -> [ is the evidence about this claim? ] -> NLI -> rating -> verdict
+                           no -> neutral, rating withheld
+```
+
+Retrieval returns the hot-water-cures-COVID debunk for "boiling water before drinking it
+reduces the risk of waterborne disease", and it is right to: both sentences are about
+drinking water. Letting that debunk's `false` rating settle the claim is what was wrong,
+and it is the worst thing this system can do (DECISIONS.md O6). So `backend/aboutness.py`
+compares the claim with the claim the fact-check *says it reviews* — lexically, on
+stemmed content words, deliberately independent of the embedding that retrieved it, since
+the failure being fixed is an embedding being confidently wrong. Neither text accounting
+for half of the other means one topic and two different assertions inside it: the
+evidence is neutral with `method="not_about"`, its rating is withheld, and it never
+reaches either model. Across languages, where word overlap measures loanwords rather than
+claims, the gate abstains instead of guessing.
+
+Documents that pass are chunked into 2–3 sentence passages, ranked against the claim
 by the multilingual embedder, and the top few go to the NLI model in one batch:
 
 ```
@@ -331,6 +378,9 @@ Two rules sit on top:
   is flagged `misleading`, so a verdict can say why it ignored the text.
 - **Nothing raises.** A missing model, a failed download or an empty document all come
   back neutral with `method="unavailable"`.
+- **A rating cannot settle a claim the evidence is not about.** The aboutness gate above
+  applies to rated items only, because a rating is the one thing that decides a stance
+  without anything having scored it.
 
 The NLI model is the same mDeBERTa checkpoint stage 2 uses for zero-shot typing, reached
 through that stage's cached pipeline — one set of weights in memory, not two.
@@ -386,7 +436,9 @@ verdict that cannot be explained is not worth giving. The order *is* the design:
    other (≥ 0.5 absolute, ≥ 2× the other side). Anything closer is `disputed`.
 4. **Nothing found is `unverified`** — the honest answer for most forwards. A system that
    guesses "false" because it found nothing is a system that cries wolf, and the fastest
-   way to make people stop reading the warnings.
+   way to make people stop reading the warnings. When the only thing found was a
+   fact-check of a *different* claim, the reply says so — and says it without repeating
+   that fact-check's rating, which beside this claim would be the accusation in prose.
 
 Labels: `false`, `misleading`, `true`, `disputed`, `unverified`. Every verdict carries the
 specific evidence that produced it, and a packet takes the worst label among its claims.
@@ -411,7 +463,87 @@ second one. Every stage is optional and every stage fails soft: with no keys and
 models this still returns a well-formed result, with `unverified` for anything it cannot
 settle. The pipeline degrades, it does not break.
 
+## Agent layer
+
+An optional coordinator *on top of* stages 1–5, not a replacement for them. The linear
+pipeline always runs the same six stages in the same order; the agent layer decides what
+is worth running for **this** message, lets each specialist abstain, and sends retrieval
+back out when a claim is left open.
+
+```python
+from backend.agents import run_agentic
+
+result = run_agentic(packet)              # same shape as pipeline.analyze
+result["verdict"]["label"]                # the same five labels, same rules
+result["explanation"]["explanation"]      # one or two evidence-based sentences
+result["agents"]["results"]["evidence"]["status"]   # ok / abstained / skipped / failed
+```
+
+`analyze(..., agentic=True)` and `POST /check/text?agentic=true` are the same thing
+through the existing entry points.
+
+Six agents, one job each:
+
+| Agent | Decides | Tools it reaches for |
+|---|---|---|
+| `orchestrator` | the route, the shared graph, handoffs, when to stop | `graph.build` |
+| `claim` | which claims are worth the retrieval budget | `claims.extract` |
+| `evidence` | which retrievers to ask, and whether one pass was enough | `evidence.collect`, `evidence.{factcheck,seed_index,web}`, `evidence.fetch_text`, `evidence.attach`, `graph.open_claims` |
+| `media` | whether there is media worth checking, and with which checks | `images.keyframes`, `images.collect` |
+| `verification` | nothing about the label — it assembles and calls the rules | `stance.apply`, `graph.totals`, `graph.decisive`, `verdict.decide` |
+| `explanation` | how to say what was found | none, by design |
+
+Every stage function is registered as a **tool** (`backend/agents/tools.py`): a name, a
+probe that says whether it can run at all (`factcheck.available()` is false without a
+key), and a call straight through to the existing function. No stage logic is duplicated
+in this package, and `ToolRegistry.call` returns a record rather than raising, so one
+dead retriever cannot take a verdict down.
+
+Every agent returns an `AgentResult` — `status`, `confidence`, structured `data`, its
+`tool_calls` — and `status` distinguishes the thing that matters most here:
+
+```
+ok         did its job; its data can be used
+abstained  ran, found the evidence insufficient, and says so
+skipped    not applicable (no media, retrieval switched off)
+failed     raised; the exception is in its notes
+```
+
+**Abstention is a first-class outcome.** An evidence agent that found nothing has told
+you something true; one that guessed would not have. A `verification` abstention is also
+the escalation trigger: the first pass asks the precise sources (fact-check API, local
+seed index) and holds the broad web search in reserve, and if a claim is still open
+afterwards the planner spends the reserve on **just those claims** with wider queries —
+one extra round, never two.
+
+Routing is a `Planner`, so the layer is provider- and model-agnostic:
+
+```python
+from backend.agents import LLMPlanner, run_agentic
+
+planner = LLMPlanner(complete=lambda prompt: call_your_model(prompt))
+result = run_agentic(packet, planner=planner)
+```
+
+`complete` is any callable from a prompt to JSON — that is the whole provider contract.
+What it returns is validated against the same `Plan` schema, a step naming an unknown
+agent is dropped, a route that forgot to verify or explain is completed, and any failure
+falls back to `RulePlanner` with the fallback recorded in the trace. `RulePlanner` is
+the default and is deterministic, because the offline path has to work: with no keys, no
+models and no network, the rules plan the route and a template writes the explanation.
+The final explanation accepts a `writer=` callable on the same terms.
+
+The labels do not move. `verification` calls `backend/verdict.py` unchanged, and the
+explanation is added as `verdict["explanation"]` *beside* `verdict["summary"]`, never in
+place of it — `summary` comes from the rule cascade and is what the bot sends.
+
 ## API
+
+There are two front doors onto the same pipeline, because two callers need different
+things. They share `backend/api/shape.py`, so a given result is the same JSON at either.
+
+**FastAPI** (`backend/api/main.py`) — what the bot talks to. Media arrives as a *path* to
+a file already on the server.
 
 ```
 GET  /health          which retrievers and models are actually switched on
@@ -422,10 +554,32 @@ POST /check/video     {"path": "...", "caption": "..."}
 POST /check/packet    a packet built elsewhere
 ```
 
+**Flask** (`backend/api/flask_app.py`) — what the browser talks to. Same endpoints under
+`/api`, and it serves `frontend/index.html` itself, which is why there is no CORS
+configuration anywhere in the project: the page and the API are one origin.
+
+```
+GET  /                the frontend
+GET  /api/health
+POST /api/check/text      {"text": "..."}          JSON or form
+POST /api/check/link      {"url": "https://..."}
+POST /api/check/image     multipart file + caption  (or {"path": ...})
+POST /api/check/video     multipart file + caption  (or {"path": ...})
+POST /api/check/packet    a packet built elsewhere
+```
+
+A browser has bytes in a form, not a path on the server, so the Flask app accepts a real
+upload: it saves it to a temp directory it owns, runs the pipeline over it, and deletes it
+in `finally` — including when a stage raises. Uploads are capped at 64 MB, rejected by
+Werkzeug before the body is read.
+
 Each returns the verdict, a `results` array with one entry per claim (label, confidence,
 explanation, reasons, evidence ids), the packet, the timeline and per-stage timings.
-`?graph=true` adds the whole serialised graph. A failure *inside* the pipeline is not an
-HTTP failure: it produces `unverified` with an explanation, which is a useful answer.
+`?graph=true` adds the whole serialised graph. `?agentic=true` runs the same stages
+through the agent layer and adds an `agents` block (the plan, each agent's structured
+result, the tool trace) plus `explanation`; everything else in the response is
+unchanged. A failure *inside* the pipeline is not an HTTP failure: it produces
+`unverified` with an explanation, which is a useful answer.
 
 Set `CLAIM_BACKEND=heuristic` for a latency-sensitive deployment — the transformer
 backend spends roughly 0.3 s per sentence on CPU.
@@ -473,22 +627,31 @@ backend/
                           transformer.py, ollama.py, extractor.py
   graph/         Stage 3a: schema.py (node/edge vocabulary), store.py (EvidenceGraph)
   evidence/      Stage 3b: schema.py (EvidenceCandidate), queries.py, normalize.py,
-                          fetch.py, collector.py,
+                          translit.py (romanised Hindi), fetch.py, collector.py,
                           retrievers/{factcheck,web,seed_index}.py
   stance/        Stage 4: passages.py, rank.py, nli.py, classify.py, graph_adapter.py
   images/        Stage 5: keyframes.py, local_index.py, reverse_search.py,
                           consistency.py, collector.py
+  agents/        agent layer: schema.py, tools.py, context.py, base.py, policy.py,
+                          orchestrator.py, {claim,evidence,media,verification,
+                          explanation}_agent.py, runner.py
   common/        cache.py, http.py   (the one seam to the outside world)
+  aboutness.py   is a piece of evidence about this claim? (the gate before stance)
   verdict.py     the rules that turn a graph into a label
   pipeline.py    ingest -> claims -> graph -> evidence -> images -> stance -> verdict
-  api/main.py    FastAPI
+  api/           main.py (FastAPI, for the bot), flask_app.py (Flask, serves the
+                          frontend and takes uploads), shape.py (the one wire format)
   bot/           guardian_bot.py, filters.py
-  tests/         pytest suite, 246 tests, offline
+  tests/         pytest suite, 336 tests, offline
   samples/       five example messages
 config/sources.yaml          domain credibility tiers
 data/seed_factchecks.jsonl   32 demo fact-checks
 data/seed_images/            8 demo placeholder images + metadata
-scripts/                     smoke_pipeline.py, smoke_evidence.py, build_image_index.py
+  evaluation/    dataset.py (the labelled set), runner.py, metrics.py,
+                          report.py, __main__.py (the CLI), DATA.md
+frontend/index.html          the UI, served by the Flask app
+scripts/                     smoke_pipeline.py, smoke_evidence.py, smoke_agents.py,
+                             build_image_index.py
 ```
 
 ## Running
@@ -505,8 +668,14 @@ python scripts/smoke_pipeline.py "your message here" --html graph.html
 python scripts/build_image_index.py                 # build the demo image index
 python scripts/smoke_evidence.py --verbose          # retrieval only, with live keys
 
-uvicorn backend.api.main:app --reload    # POST /check/text {"text": "..."}
+uvicorn backend.api.main:app --reload    # the bot's API: POST /check/text
+python -m backend.api.flask_app          # the UI: http://127.0.0.1:5000
 ```
+
+Open http://127.0.0.1:5000 for the frontend — not `frontend/index.html` off disk. Served
+from the Flask app the page and the API share an origin; opened as a `file://` URL the
+page falls back to `http://127.0.0.1:5000/api` and the browser will block it as
+cross-origin.
 
 Image and video ingest additionally need `easyocr openai-whisper yt-dlp` and `ffmpeg` on
 PATH. `AI_DETECTOR_MODEL=<hf model id>` enables AI-generated-image scoring.
@@ -524,12 +693,64 @@ free memory. Below that the model loads fail, and the pipeline returns `unverifi
 the failure logged rather than crashing — which is the intended behaviour, but it does
 mean a memory-starved machine will quietly find no evidence.
 
+## Evaluation
+
+`backend/evaluation/` scores the pipeline against a labelled set of 41 messages
+(`data/eval_cases.jsonl`). It runs `backend.pipeline.analyze` — the entry point the API
+and the bot use — rather than reaching into the stages, because an evaluation that
+exercises a private path measures a system nobody ships.
+
+```powershell
+python -m backend.evaluation                     # stages 1-3b (the default)
+python -m backend.evaluation --mode full         # + stance and verdict
+python -m backend.evaluation --mode claims       # stage 2 only
+
+python -m backend.evaluation --language hinglish
+python -m backend.evaluation --case chat_salt
+python -m backend.evaluation --json runs/today.json
+python -m backend.evaluation --mode full --gate  # exit 1 on a wrong accusation
+```
+
+| mode | stages | measures | cost |
+|---|---|---|---|
+| `claims` | 1-2 | check-worthiness | minutes (loads the NER model) |
+| `retrieval` | 1-3b | + did the right entry come back | minutes |
+| `full` | everything | + the verdict itself | ~45 s a case |
+
+Three things about the design are load-bearing.
+
+**The safety number is separate from the accuracy number.** Missing a rumour leaves the
+user where they started; telling someone their true message is false is the system doing
+harm on its own initiative. `false_accusations` is printed on its own line at the top of
+the report, it is the only thing `--gate` fails on, and it should be zero.
+
+**Cases whose answer is in the demo index are scored apart from cases whose answer is
+not.** 24 of the 41 can be settled from `data/seed_factchecks.jsonl`; the other 17 cannot
+be settled at all, and for those the correct behaviour is to say nothing. A single
+blended accuracy would let a gain in one hide a loss in the other.
+
+**A mode that did not run a stage reports nothing for it, not zero.** With stage 4 off
+every claim is trivially `unverified`, and recording that as a prediction would invent an
+accuracy figure out of a stage that never ran.
+
+`backend/evaluation/DATA.md` documents what the labelled set has to contain — both
+directions of the asymmetry, the same rumour in all three languages, benign near-misses,
+and known regressions pinned as cases — and is explicit about what the numbers are not
+evidence of. The short version: the set is 41 hand-written cases over a 32-entry
+synthetic index. It catches regressions. It does not establish performance, and no figure
+from it should be quoted as "N% accurate at detecting misinformation".
+
 ## Known limits
 
-- **Romanised Hinglish is the weak spot.** The multilingual embedder matches Devanagari
-  to English well, but "garam paani peene se corona theek ho jata hai" does not reach its
-  Devanagari counterpart above the retrieval floor. Transliterating before embedding is
-  the obvious next step.
+- **Romanised Hinglish is transliterated, not understood.** The multilingual embedder
+  cannot read Latin-script Hindi, so `backend/evidence/translit.py` rewrites a romanised
+  query into Devanagari before it is embedded and the retriever scores each entry on
+  whichever spelling fits better (10/10 Hinglish claims matched, up from 6/10; the 0.45
+  floor is unchanged and English and Devanagari queries are untouched). The lexicon is
+  ~330 words, so an unrecognised Hindi word stays in Latin script and simply does not
+  help. Raising Hinglish similarity also raises it for Hinglish chit-chat: one everyday
+  sentence about buying salt now clears the floor against the salt-shortage rumour. See
+  DECISIONS.md O1.
 - **The demo corpora are demo data.** 32 synthetic fact-check records and 8 generated
   placeholder images, marked as such everywhere they surface. They make the pipeline
   demonstrable offline; they are not a basis for any claim about the real world.

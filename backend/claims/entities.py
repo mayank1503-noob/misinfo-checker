@@ -130,6 +130,49 @@ STOP_START = {
 _SENTENCE_INITIAL = re.compile(r"^\s*(?:\w+:\s*)?$")
 _ADJ_SHAPE = re.compile(r"(?:ing|ive|ed|ly|ous|ful|less|able|ible)$", re.IGNORECASE)
 
+
+WORD_BOUNDARY = r"\b{}\b"
+
+# A finite verb straight after the word: an English inflected form, an
+# auxiliary, or the Hindi ergative-plus-verb that follows a subject
+# ("RBI ne kaha", "sarkar ne bataya").
+SUBJECT_OF_VERB = re.compile(
+    r"\s+(?:\w+\s+)?(?:is|are|was|were|has|have|had|will|can|does|did|do|"
+    r"ne|hai|hain|tha|thi|the|kaha|bola|bataya|"
+    r"[a-z]+(?:es|ed|ing)|[a-z]{3,}s)\b"
+)
+
+
+def _corroborated(text, sentence, start):
+    """
+    Is this sentence-initial capitalised word a name on evidence other
+    than its position?
+
+    Any one of: it is an acronym, it hints at an organisation or a place,
+    a person title precedes it, or it appears capitalised again later in
+    the sentence, where the sentence start cannot explain the capital.
+    """
+    if text.isupper():
+        return True
+
+    if ORG_HINT.search(text) or any(w in GPE_HINT for w in text.lower().split()):
+        return True
+
+    if PERSON_TITLE.search(sentence[max(0, start - 20):start]):
+        return True
+
+    rest = sentence[start + len(text):]
+
+    if re.search(WORD_BOUNDARY.format(re.escape(text)), rest):
+        return True
+
+    # Subject position: "Modi announces...", "UNESCO has declared...",
+    # "RBI ne kaha...". A capitalised word followed by a finite verb is
+    # doing the verb, which is what a name does and what "Kal shaam",
+    # "Namak lekar" and "Aaj office" — capital then noun — do not.
+    return bool(SUBJECT_OF_VERB.match(rest))
+
+
 GPE_HINT = {
     "india", "delhi", "mumbai", "bengaluru", "bangalore", "chennai", "kolkata",
     "hyderabad", "pune", "kerala", "tamil", "nadu", "gujarat", "maharashtra",
@@ -279,10 +322,24 @@ def extract_entities(sentence):
         if len(text) < 3 or _overlaps(span, taken):
             continue
 
-        # "Massive earthquake", "Drinking hot water": capitalised only
-        # because the sentence starts there, and shaped like an adjective.
-        if len(words) == 1 and _SENTENCE_INITIAL.match(sentence[:start]) and _ADJ_SHAPE.search(text):
-            continue
+        # A lone capitalised word at the start of a sentence is the
+        # weakest possible evidence of a name, because *every* sentence
+        # starts with a capital. "Massive earthquake", "Drinking hot
+        # water", "Kal shaam ko ghar aa raha hoon", "Namak lekar aana" —
+        # the first word is capitalised by orthography, not because it
+        # names anything, and romanised Hindi hits this constantly since
+        # its everyday words are not in any English vocabulary.
+        #
+        # So a single sentence-initial word has to corroborate itself
+        # some other way: an organisation or place hint, a person title
+        # in front of it, an acronym's capitals, or the same word
+        # capitalised again later in the sentence where orthography does
+        # not explain it. Multi-word spans are unaffected — "Reserve
+        # Bank" is not an accident — and so is any word anywhere else in
+        # the sentence.
+        if len(words) == 1 and _SENTENCE_INITIAL.match(sentence[:start]):
+            if not _corroborated(text, sentence, start):
+                continue
 
         lowered = text.lower()
         before = sentence[max(0, start - 20):start]

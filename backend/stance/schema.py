@@ -31,6 +31,7 @@ METHODS = (
     "nli",          # decided by the entailment model
     "rating",       # decided by the publisher's own verdict (overrides nli)
     "off_topic",    # no passage cleared the relevance cutoff
+    "not_about",    # retrieved on topic, but it reviews a different claim
     "unavailable",  # a model was missing or failed — failed soft to neutral
 )
 

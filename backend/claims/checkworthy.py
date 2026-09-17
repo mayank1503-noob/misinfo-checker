@@ -4,9 +4,40 @@ Decide whether a sentence is a check-worthy factual claim, and what kind.
 Everything here is a heuristic feature -> weight table so the behaviour is
 inspectable. The `signals` dict returned alongside the score is stored on
 the Claim for evaluation later.
+
+## Two scripts, one table
+
+The tables below are written in Latin script, and deliberately mix English
+with romanised Hindi: "government|sarkar", "cure|ilaaj", "free|muft". That
+is what lets a Hinglish forward score like the English message it is a
+translation of. It also meant a *Devanagari* sentence matched nothing at
+all: "सरकार सभी छात्रों को मुफ्त लैपटॉप दे रही है" is the same claim as
+"Sarkar sabhi students ko free laptop de rahi hai", but every pattern here
+missed it, so it scored the bare 0.30 base and was dropped before
+retrieval was ever asked (DECISIONS.md O7).
+
+So a Devanagari sentence is also read in its romanised spelling, through
+the same lexicon the retrieval side already uses in the other direction,
+and a feature counts when *either* spelling shows it. The sentence itself
+is never rewritten: what is stored on the Claim, sent to retrieval and
+shown to a person is always the text as it arrived — only the feature
+tables see the second spelling.
+
+This cuts both ways on purpose. The penalties are read in both spellings
+too, so Devanagari chat is still chat: "मैं कल घर आ रहा हूँ" romanises to
+"main kal ghar aa raha hoon" and takes the same interpersonal penalty its
+Hinglish twin does. Hindi is made *legible* to the table, not exempt from
+it.
+
+Nothing about English or romanised Hindi changes: `romanised()` returns
+None for both, no second reading is built, and the signals are the ones
+this module always produced.
 """
 
 import re
+
+from ..translit import romanised
+from .entities import extract_time_refs
 
 
 CHECK_WORTHY_THRESHOLD = 0.45
@@ -22,6 +53,20 @@ OPINION = re.compile(
     r"personally|honestly|i\s+am\s+(?:sure|not sure)|mujhe lagta|mera manna|lagta hai|shayad|"
     r"maybe|probably|perhaps|should|must|best|worst|amazing|awesome|beautiful|terrible|"
     r"disgusting|great|bad|good|nice|lovely|boring|so cute|omg|lol|lmao)\b",
+    re.IGNORECASE,
+)
+
+# Romanised Hindi marks the person on the verb, so "aa raha hoon" (I am
+# coming) and "kar paya" (I could) are first-person the way "I am" is,
+# with no pronoun anywhere in the sentence for PERSONAL to match. A
+# message that conjugates itself to a speaker and an addressee is
+# interpersonal, whatever nouns it happens to contain.
+FIRST_SECOND_PERSON = re.compile(
+    r"\b(?:hoon|huun|hun|rahaa?\s+hoon|rahi\s+hoon|karunga|karungi|karunga|"
+    r"paya|payi|paaya|sakta\s+hoon|sakti\s+hoon|"
+    r"tum|tumhe|tumhara|tumhari|tere|tera|teri|aap|aapko|aapka|aapki|"
+    r"rukoge|jaoge|aaoge|karoge|bataoge|milte|milenge|"
+    r"mujhe|mujhko|mera|meri|mere|hamara|hamari|humein|apna|apni)\b",
     re.IGNORECASE,
 )
 
@@ -51,7 +96,7 @@ ATTRIBUTION = re.compile(
 )
 
 POLICY = re.compile(
-    r"\b(?:government|govt|sarkar|ministry|minister|rbi|sebi|supreme court|high court|"
+    r"\b(?:government|govt|sarkar|sarkari|ministry|minister|rbi|sebi|supreme court|high court|"
     r"parliament|lok sabha|rajya sabha|scheme|yojana|policy|law|act|ban|banned|"
     r"mandatory|compulsory|order|notification|circular|rule|rules|tax|gst|aadhaar|"
     r"pan card|voter|election|passport|ration|subsidy|pension)\b",
@@ -62,7 +107,7 @@ HEALTH = re.compile(
     r"\b(?:cure|cures|cured|vaccine|vaccines|vaccination|virus|covid|corona|cancer|"
     r"diabetes|disease|infection|medicine|drug|tablet|doctor|doctors|hospital|"
     r"who|symptom|symptoms|immunity|dengue|malaria|flu|fever|heart attack|"
-    r"deadly|poison|toxic|side effect|side effects|ilaaj|dawai|bimari)\b",
+    r"deadly|poison|toxic|side effect|side effects|polio|ilaaj|dawai|bimari)\b",
     re.IGNORECASE,
 )
 
@@ -131,36 +176,71 @@ def detect_language(text):
     return "en"
 
 
-def score(sentence, entities, time_refs):
+def readings(sentence):
+    """
+    The spellings of `sentence` the feature tables should be run over.
+
+    One for English and for romanised Hindi; two for Devanagari, which the
+    tables cannot read as it stands. The original is always first, and is
+    the only one anything outside this module ever sees.
+    """
+    second = romanised(sentence)
+
+    return [sentence, second] if second else [sentence]
+
+
+def _any(pattern, texts, match=False):
+    """True when `pattern` fires in any spelling of the sentence."""
+    find = pattern.match if match else pattern.search
+
+    return any(bool(find(text)) for text in texts)
+
+
+def score(sentence, entities, time_refs, texts=None):
     """
     Return (confidence, check_worthy, signals).
+
+    `texts` is the spellings to read the sentence in, defaulting to
+    `readings(sentence)` — which adds a romanisation for Devanagari and
+    nothing at all for anything else.
     """
     tokens = sentence.split()
     n = len(tokens)
+
+    texts = list(texts) if texts else readings(sentence)
 
     labels = {e.label for e in entities}
     named = labels & {"PERSON", "ORG", "GPE", "PROPER"}
     quantified = labels & {"NUMBER", "MONEY", "PERCENT"}
 
+    # A date written in Devanagari ("कल से") is a time reference exactly
+    # the way "kal se" is. The reference itself is deliberately not kept:
+    # its offsets are into the romanisation rather than into the sentence
+    # the Claim stores, and only whether there *is* one carries weight.
+    dated = bool(time_refs) or any(
+        bool(extract_time_refs(text)) for text in texts[1:]
+    )
+
     signals = {
         "tokens": n,
-        "question": bool(QUESTION.search(sentence)),
-        "opinion": bool(OPINION.search(sentence)),
-        "personal": bool(PERSONAL.search(sentence)),
-        "greeting": bool(GREETING.match(sentence)),
-        "imperative_only": bool(IMPERATIVE_ONLY.match(sentence)),
-        "has_verb": bool(VERB_LIKE.search(sentence)),
+        "question": _any(QUESTION, texts),
+        "opinion": _any(OPINION, texts),
+        "personal": _any(PERSONAL, texts),
+        "person_marked": _any(FIRST_SECOND_PERSON, texts),
+        "greeting": _any(GREETING, texts, match=True),
+        "imperative_only": _any(IMPERATIVE_ONLY, texts, match=True),
+        "has_verb": _any(VERB_LIKE, texts),
         "named_entity": bool(named),
         "quantity": bool(quantified),
-        "time_ref": bool(time_refs),
-        "attribution": bool(ATTRIBUTION.search(sentence)),
-        "policy": bool(POLICY.search(sentence)),
-        "health": bool(HEALTH.search(sentence)),
-        "chain_offer": bool(CHAIN_OFFER.search(sentence)),
-        "prediction": bool(PREDICTION.search(sentence)),
-        "causal": bool(CAUSAL.search(sentence)),
-        "event": bool(EVENT.search(sentence)),
-        "urgency": bool(URGENCY.search(sentence)),
+        "time_ref": dated,
+        "attribution": _any(ATTRIBUTION, texts),
+        "policy": _any(POLICY, texts),
+        "health": _any(HEALTH, texts),
+        "chain_offer": _any(CHAIN_OFFER, texts),
+        "prediction": _any(PREDICTION, texts),
+        "causal": _any(CAUSAL, texts),
+        "event": _any(EVENT, texts),
+        "urgency": _any(URGENCY, texts),
         "url": "URL" in labels,
         "contact": bool(labels & {"PHONE", "UPI"}),
     }
@@ -196,7 +276,28 @@ def score(sentence, entities, time_refs):
         value -= 0.35
     if signals["opinion"]:
         value -= 0.25
-    if signals["personal"] and not (signals["named_entity"] or signals["quantity"]):
+    # A name does not stop a message being chat: "Rahul, call me when you
+    # land" is addressed to somebody, not asserted to the world, and the
+    # name is the least surprising thing in it. Only a quantity earns the
+    # exemption, because "they credited me Rs 5,000" is a factual
+    # statement that happens to be phrased personally.
+    #
+    # This used to read `not (named_entity or quantity)`, which meant any
+    # stray capitalised word switched the rule off entirely — and in
+    # romanised Hindi the first word of every sentence looked like one.
+    # ...but a forward that opens "Bhai suno" and then attributes a health
+    # claim to the WHO is a rumour wearing a vocative, and the commonest
+    # shape a rumour arrives in. So the chat penalty only applies to a
+    # sentence that asserts nothing checkable: no attribution, no policy
+    # or health or event subject, no offer, no number. Those are the
+    # things a person forwards; "kal ghar aa raha hoon" has none of them.
+    asserts_something = (
+        signals["attribution"] or signals["policy"] or signals["health"]
+        or signals["event"] or signals["chain_offer"] or signals["quantity"]
+        or signals["urgency"] or signals["contact"] or signals["url"]
+    )
+
+    if (signals["personal"] or signals["person_marked"]) and not asserts_something:
         value -= 0.30
     if signals["imperative_only"] and not (signals["quantity"] or signals["chain_offer"]):
         value -= 0.20

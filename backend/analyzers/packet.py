@@ -3,6 +3,11 @@ from . import image
 from . import video
 
 
+# Where a packet lists the temp paths it owns. Leading underscore: it is
+# bookkeeping, and `pipeline._public_packet` strips it from responses.
+TEMP_PATHS = "_temp_paths"
+
+
 def _packet(input_type, text="", source_date=None, images=None):
     return {
         "input_type": input_type,
@@ -29,17 +34,50 @@ def from_image(path, caption=""):
     )
 
 
-def from_video(path, caption=""):
-    transcript, frames = video.analyze(path)
+def from_video(path, caption="", workdir=None):
+    """
+    A packet from a video file.
+
+    The keyframes live in a temp directory that stages 4-6 still read by
+    path, so the packet carries it under TEMP_PATHS and whoever built the
+    packet calls `cleanup(packet)` once the pipeline is done with it.
+    """
+    transcript, frames, workdir = video.analyze(path, workdir=workdir)
 
     text = (caption + "\n" + transcript).strip()
 
-    return _packet(
+    packet = _packet(
         "video",
         text,
         images=frames
     )
 
+    packet[TEMP_PATHS] = [workdir]
 
-def from_video_url(url):
-    return from_video(video.download(url))
+    return packet
+
+
+def from_video_url(url, caption=""):
+    """The same, for a video we fetch ourselves; the download is temp too."""
+    workdir = video.workspace()
+
+    try:
+        return from_video(
+            video.download(url, workdir=workdir),
+            caption,
+            workdir=workdir,
+        )
+    except BaseException:
+        video.discard(workdir)
+        raise
+
+
+def cleanup(packet):
+    """
+    Delete the temp files a packet owns.
+
+    Safe on any packet and safe to call twice: text, link and image
+    packets own nothing.
+    """
+    for path in (packet or {}).pop(TEMP_PATHS, None) or []:
+        video.discard(path)

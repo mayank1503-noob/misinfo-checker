@@ -17,7 +17,12 @@ Two things are deliberate:
     `backend.stance.rank.embedder()`, which is `lru_cache`d — so the
     multilingual MiniLM lives in memory once, whether it was the ranker
     or this index that asked for it first. The model is multilingual, so
-    a Hinglish claim matches an English seed entry.
+    a Hindi claim matches an English seed entry.
+  * **A romanised Hindi query is searched twice.** The model reads
+    Devanagari but not Latin-script Hindi, so `backend.evidence.translit`
+    offers a Devanagari spelling of the query and each entry scores as
+    well as its better-matching spelling does. English and Devanagari
+    queries produce one spelling and are scored exactly as before.
   * **FAISS is optional.** With `faiss` installed the search uses an
     inner-product index; without it, the same normalised vectors are
     compared with NumPy. At thirty entries the difference is invisible,
@@ -34,6 +39,7 @@ import os
 from datetime import date
 from functools import lru_cache
 
+from .. import translit
 from ..schema import EvidenceCandidate
 
 
@@ -187,15 +193,17 @@ def _faiss_index(path=None):
         return None
 
 
-def _query_vector(text):
+def _query_vectors(texts):
+    """One L2-normalised row per spelling of the query."""
     from ...stance import rank
 
     import numpy as np
 
-    vector = np.asarray(rank.embed([text])[0], dtype="float32")
-    norm = float(np.linalg.norm(vector)) or 1.0
+    matrix = np.asarray(rank.embed(list(texts)), dtype="float32")
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
 
-    return (vector / norm).reshape(1, -1)
+    return matrix / norms
 
 
 def _entry_to_candidate(entry, claim_id, query, similarity):
@@ -266,8 +274,13 @@ def search(claim_id, query, top_k=TOP_K, floor=SIMILARITY_FLOOR, path=None):
         log.info("seed index unavailable (no embedder or no corpus); skipping")
         return []
 
+    # A romanised Hindi query is embedded twice: as typed, and in
+    # Devanagari. Everything else yields exactly one spelling, so its
+    # search is unchanged. See backend/evidence/translit.py.
+    spellings = translit.variants(text)
+
     try:
-        vector = _query_vector(text)
+        vectors = _query_vectors(spellings)
     except Exception as error:                       # fail soft, never raise
         log.warning("seed index query failed (%s): %s", type(error).__name__, error)
         return []
@@ -276,24 +289,42 @@ def search(claim_id, query, top_k=TOP_K, floor=SIMILARITY_FLOOR, path=None):
     index = _faiss_index(path)
 
     if index is not None:
-        scores, positions = index.search(vector, wanted)
-        pairs = list(zip(positions[0].tolist(), scores[0].tolist()))
+        scores, positions = index.search(vectors, wanted)
+        pairs = [
+            (int(position), float(score))
+            for row_positions, row_scores in zip(positions.tolist(), scores.tolist())
+            for position, score in zip(row_positions, row_scores)
+        ]
     else:
         import numpy as np
 
-        similarities = (matrix @ vector[0])
+        # Each entry scores as well as its best-matching spelling of the
+        # query does: max, not mean, because a Hinglish claim is meant to
+        # be recognised by whichever of the two the model can read — and
+        # a mean would let the unreadable spelling drag the good one
+        # back under the floor.
+        similarities = (matrix @ vectors.T).max(axis=1)
         order = np.argsort(-similarities)[:wanted]
         pairs = [(int(position), float(similarities[position])) for position in order]
 
-    found = []
+    best = {}
 
     for position, similarity in pairs:
         if position < 0 or similarity < floor:
             continue
 
-        found.append(
-            _entry_to_candidate(entries[position], claim_id, text, similarity)
-        )
+        if similarity > best.get(position, -1.0):
+            best[position] = similarity
+
+    found = []
+
+    for position, similarity in sorted(best.items(), key=lambda p: -p[1])[:wanted]:
+        candidate = _entry_to_candidate(entries[position], claim_id, text, similarity)
+
+        if len(spellings) > 1:
+            candidate.meta["query_devanagari"] = spellings[1]
+
+        found.append(candidate)
 
     return found
 

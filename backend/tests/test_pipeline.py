@@ -230,6 +230,31 @@ def test_related_but_uncommitted_evidence_is_still_unverified():
     assert "none of it takes a side" in verdict["explanation"]
 
 
+def test_a_fact_check_of_another_claim_says_so_instead_of_convicting():
+    """
+    DECISIONS.md O6: stage 4 gates a fact-check that reviews a different
+    claim (`method="not_about"`), so its `false` rating never reaches the
+    totals. The verdict is `unverified` — and it says a near-miss
+    fact-check exists, without repeating its rating, which for this claim
+    would be the accusation in prose.
+    """
+    claims, graph, _pkt = graph_with()
+    claim_id = claims.claims[0].id
+
+    add_evidence(graph, claim_id, "ev_neighbour")
+    graph.set_stance(
+        "ev_neighbour", claim_id, "neutral", score=0.0, method="not_about"
+    )
+
+    verdict = verdict_for_claim(graph, claim_id)
+
+    assert verdict["label"] == "unverified"
+    assert graph.stance_totals(claim_id)["refutes"] == 0
+    assert "No fact-check of this claim" in verdict["explanation"]
+    assert "similar-sounding claim" in verdict["reasons"][0]
+    assert "rated it" not in verdict["explanation"]
+
+
 def test_weighted_refutation_without_a_decisive_hit():
     claims, graph, _pkt = graph_with()
     claim_id = claims.claims[0].id

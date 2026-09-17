@@ -14,3 +14,8 @@ lib/
 
 # generated demo assets (rebuild: python scripts/build_image_index.py)
 data/image_index.json
+
+# the frontend's own pages are not pyvis scratch output
+!web/index.html
+!frontend/index.html
+node_modules/

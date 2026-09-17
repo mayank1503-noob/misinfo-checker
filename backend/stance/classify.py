@@ -8,6 +8,18 @@ rank them against the claim with a multilingual embedder, send the top few
 to the entailment model in one batch, and let the strongest non-neutral
 verdict win.
 
+Before any of that, one question is asked that retrieval does not
+answer: **is this piece of evidence actually about this claim?**
+`backend.aboutness` compares the claim with the claim the evidence says
+it reviews, lexically — independently of the embedding that retrieved it.
+When the answer is no, the item is neutral with method `not_about`, it
+never reaches the ranker or the entailment model, and its publisher
+rating is withheld. This is the O6 fix: a fact-check of a *neighbouring*
+rumour was rating a benign statement false. The gate applies only to
+items that carry a rating, because a rating is what can settle a claim
+without anything having scored it, and because only a fact-check states
+the claim it is about.
+
 Two rules sit on top of the model:
 
   * A publisher's own rating beats the text. Fact-check articles quote the
@@ -27,6 +39,7 @@ This module is pure: it reads claims and evidence and returns results. It
 neither builds nor touches the evidence graph.
 """
 
+from .. import aboutness
 from . import nli, rank
 from .passages import split_passages
 from .rank import RELEVANCE_CUTOFF, TOP_K
@@ -189,8 +202,37 @@ def _result(item, stance, score, relevance, best_passage, method, misleading, no
     )
 
 
-def _classify_item(item, ranking, distributions, note):
+def judge_aboutness(claim_text, item):
+    """
+    Whether this item's rating may speak for this claim at all.
+
+    Only rated items are judged. An unrated article is read by the
+    entailment model, which has its own relevance cutoff and cannot
+    convict a claim on its own; and its title is a headline rather than a
+    claim under review, so gating on it would discard evidence for being
+    briefly worded. A rated item is different: the rating decides the
+    stance outright, so what it is a rating *of* has to be checked.
+    """
+    if not (item.rating or "").strip():
+        return None
+
+    try:
+        return aboutness.judge_any(claim_text, item.title, item.snippet)
+    except Exception:            # fail soft: this stage never raises
+        return None
+
+
+def _classify_item(item, ranking, distributions, note, judgement=None):
     """Decide one evidence item, then let its rating have the last word."""
+    if judgement is not None and judgement.blocks_rating:
+        # Retrieved on topic, but it reviews a different claim. Neutral,
+        # and the rating does not get to settle anything — including
+        # through `decisive`, which is marked in stage 3.
+        return _result(
+            item, "neutral", 0.0, 0.0, None, "not_about", False,
+            "rating {!r} withheld: {}".format(item.rating, judgement.note),
+        )
+
     top = ranking.passages[0] if ranking is not None and ranking.passages else None
     best = ranking.best if ranking is not None else 0.0
 
@@ -270,19 +312,37 @@ def classify_stance(claims, evidence, top_k=TOP_K, cutoff=RELEVANCE_CUTOFF):
 
             continue
 
-        passage_groups = [split_passages(item.body) for _position, item in group]
+        judgements = [judge_aboutness(claim_text, item) for _position, item in group]
+
+        # Gated evidence is handed no passages, so it costs neither an
+        # embedding nor an entailment pass: the question "is this about
+        # the claim" is answered before the models are asked anything.
+        passage_groups = [
+            [] if (judgement is not None and judgement.blocks_rating)
+            else split_passages(item.body)
+            for (_position, item), judgement in zip(group, judgements)
+        ]
 
         rankings, rank_note = _rank_group(claim_text, passage_groups, top_k, cutoff)
 
         if rankings is None:
-            for position, item in group:
-                results[position] = _classify_item(item, None, [], rank_note)
+            for (position, item), judgement in zip(group, judgements):
+                results[position] = _classify_item(
+                    item, None, [], rank_note, judgement
+                )
 
             continue
 
         grouped, nli_note = _score_group(claim_text, rankings)
 
         for index, (position, item) in enumerate(group):
+            judgement = judgements[index]
+
+            if judgement is not None and judgement.blocks_rating:
+                results[position] = _classify_item(item, None, [], None, judgement)
+
+                continue
+
             if not passage_groups[index]:
                 # Nothing to read — not the same thing as reading it and
                 # finding it off-topic.

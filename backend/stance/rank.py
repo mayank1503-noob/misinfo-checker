@@ -63,7 +63,11 @@ def available():
 def embedder():
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(os.getenv("STANCE_EMBED_MODEL", DEFAULT_EMBED_MODEL))
+    from ..torch_runtime import prepare
+
+    return prepare(
+        SentenceTransformer(os.getenv("STANCE_EMBED_MODEL", DEFAULT_EMBED_MODEL))
+    )
 
 
 def embed(texts):
@@ -73,7 +77,13 @@ def embed(texts):
     if not texts:
         return []
 
-    vectors = embedder().encode(texts)
+    from ..torch_runtime import inference
+
+    # Stage 3b calls this from inside two nested thread pools, so this is
+    # the forward pass that used to run several times over. See
+    # backend/torch_runtime.py.
+    with inference():
+        vectors = embedder().encode(texts)
 
     return [[float(value) for value in vector] for vector in vectors]
 
