@@ -12,3 +12,13 @@ pytest
 # on Windows/CPU: pip install torch --index-url https://download.pytorch.org/whl/cpu
 transformers
 torch
+
+# stage 3a: the evidence graph
+networkx
+pyvis                                    # optional: export_html only
+
+# stage 3b: evidence retrieval
+PyYAML                                   # config/sources.yaml
+faiss-cpu                                # optional: the seed index falls back to numpy
+sentence-transformers                    # shared by the seed index and stage 4 ranking
+numpy

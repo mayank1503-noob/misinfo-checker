@@ -1,265 +1,222 @@
 """
-Data model for the evidence graph (Stage 3A).
+What a retriever returns (Stage 3b).
 
-Stage 2 hands over a ClaimSet; `ClaimSet.to_graph_seed()` turns it into a
-flat {"nodes": [...], "edges": [...]} skeleton of packet / claim / entity
-nodes. This stage grows that skeleton: a retriever produces `Evidence`
-objects, which become `evidence` nodes joined to claims by HAS_EVIDENCE
-and SUPPORTS / REFUTES / UNCERTAIN_FOR edges.
+An `EvidenceCandidate` is one thing we found that might bear on one claim.
+"Might" is the important word: this stage retrieves and normalises, and
+deliberately does not judge. `stance` stays None until stage 4 reads the
+text and decides, and the two jobs are kept apart because a retriever
+that also guessed at stance would bury its guess inside a relevance
+score, where nothing could audit it.
 
-Stage 3A is the data layer only — nothing here touches the network. The
-retriever (3B) builds `Evidence` objects; the verdict stage (4) reads the
-graph back out.
+Two fields do come back from retrieval, because they are facts about the
+*source* rather than readings of the text:
 
-Nodes and edges stay flat dicts on the wire (the same shape the seed
-uses), so a graph round-trips through JSON without a schema migration,
-while the Node / Edge models give the graph code typed access to `id`,
-`kind`, `type` and the free-form rest (`attrs`).
+  * `rating` / `rating_raw` — a fact-check publisher's own verdict, kept
+    both normalised and verbatim. Stage 4 lets this override the model.
+  * `source_weight` — how much credibility the domain gets, from
+    `config/sources.yaml`.
+
+Ids are derived from the claim plus the canonical URL, so the same
+article retrieved by two different queries, or by two different
+retrievers, is one candidate with one id.
 """
 
+import re
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 from ..claims.schema import stable_id
 
 
-NODE_KINDS = (
-    "packet",     # the ingested media packet (stage 1)
-    "claim",      # an extracted claim (stage 2)
-    "entity",     # a person / org / amount / date mentioned by a claim
-    "evidence",   # a retrieved document or media match (stage 3)
+SOURCE_TYPES = (
+    "factcheck",      # Google Fact Check Tools / a fact-check publisher
+    "web",            # a general web search result
+    "seed_index",     # the local demo index of known rumours
+    "reverse_image",  # an image match (stage 5)
+    "image_caption",  # a caption/image consistency check (stage 5)
 )
 
-EDGE_TYPES = (
-    "HAS_CLAIM",       # packet   -> claim
-    "MENTIONS",        # claim    -> entity
-    "SHARES_ENTITY",   # claim    -> claim      (via a common entity)
-    "HAS_EVIDENCE",    # claim    -> evidence   (retrieved for this claim)
-    "SUPPORTS",        # evidence -> claim
-    "REFUTES",         # evidence -> claim
-    "UNCERTAIN_FOR",   # evidence -> claim      (relevant, takes no side)
+RATINGS = ("false", "misleading", "true", "unknown")
+
+
+# Tracking parameters carry no meaning and would split one article into
+# several candidates, so they are stripped before an id is minted.
+_TRACKING_PARAMS = re.compile(
+    r"^(utm_|fbclid$|gclid$|igshid$|mc_cid$|mc_eid$|ref$|ref_src$|s$|_ga$)",
+    re.IGNORECASE,
 )
 
-EVIDENCE_TYPES = (
-    "fact_check",     # Google Fact Check Tools, IFCN publishers
-    "news",           # a news article covering the claim
-    "rumor_index",    # local index of known scams / recycled rumours
-    "reverse_image",  # DINOv2 embedding match against a known image
-    "date_check",     # source_date / exif_date vs. the claimed date
-    "official",       # government / company statement: RBI, PIB, ...
-    "other",
-)
-
-RELATIONS = ("supports", "refutes", "uncertain")
-
-# relation -> the evidence->claim edge that carries it
-RELATION_EDGES = {
-    "supports": "SUPPORTS",
-    "refutes": "REFUTES",
-    "uncertain": "UNCERTAIN_FOR",
-}
+_AMP_SUFFIX = re.compile(r"/amp/?$|\.amp$", re.IGNORECASE)
 
 
-def _domain(url):
-    """Host of a URL, without scheme or `www.` — used as the publisher."""
+def canonical_url(url):
+    """
+    Reduce a URL to the thing that identifies the document.
+
+    Lowercases the host, drops `www.`, the scheme's default port, the
+    fragment, tracking parameters and an `/amp` suffix, normalises the
+    scheme to https, and sorts what query parameters remain. Two links to
+    the same article that differ only in how they were shared collapse to
+    one string — which is what the dedupe in `normalize.py` and the
+    candidate id both depend on.
+
+    The scheme is normalised rather than preserved because `http://` and
+    `https://` on the same host are the same document in every case that
+    matters here, and keeping both would split one fact-check into two
+    pieces of evidence that then "agree" with each other.
+    """
     if not url:
-        return None
+        return ""
 
-    rest = url.split("://", 1)[-1]
-    host = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-    host = host.split("@")[-1].split(":")[0].lower()
+    text = str(url).strip()
+
+    if not text:
+        return ""
+
+    if "//" not in text:
+        text = "https://" + text
+
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return text.lower()
+
+    host = (parts.hostname or "").lower()
 
     if host.startswith("www."):
         host = host[4:]
 
-    return host or None
+    if parts.port and parts.port not in (80, 443):
+        host = f"{host}:{parts.port}"
+
+    path = _AMP_SUFFIX.sub("", parts.path or "")
+
+    if path.endswith("/") and len(path) > 1:
+        path = path[:-1]
+
+    query = urlencode(
+        sorted(
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if not _TRACKING_PARAMS.match(key)
+        )
+    )
+
+    scheme = "https" if parts.scheme.lower() in ("http", "https", "") else parts.scheme.lower()
+
+    return urlunsplit((scheme, host, path, query, ""))
 
 
-class EvidenceSource(BaseModel):
+def domain_of(url):
+    """The registrable-ish host of a URL, without `www.`, or ''."""
+    if not url:
+        return ""
+
+    try:
+        host = (urlsplit(canonical_url(url)).hostname or "").lower()
+    except ValueError:
+        return ""
+
+    return host
+
+
+def candidate_id(claim_id, source_type, url=None, title=None, snippet=None):
     """
-    Where a piece of evidence came from.
+    Deterministic id for one candidate.
 
-    `published` is the date the source itself states (often missing);
-    `retrieved` is when we fetched it. Only `published` matters for
-    recycled-media checks, so the two are kept apart rather than merged.
+    Keyed on the claim as well as the document: the same article
+    retrieved for two different claims is two candidates, because the
+    stance stage will judge it separately against each. Where there is no
+    URL (the seed index, an image match) the title and snippet stand in.
     """
+    fingerprint = canonical_url(url) or f"{title or ''}|{(snippet or '')[:200]}"
 
-    url: Optional[str] = None
-    title: Optional[str] = None
-    publisher: Optional[str] = None     # falls back to the URL's domain
-    domain: Optional[str] = None        # derived from `url`
-    published: Optional[str] = None     # ISO date, if the source states one
-    retrieved: Optional[str] = None     # ISO date we fetched it (never in the id)
-    rating: Optional[str] = None        # publisher's own verdict text, if any
-
-    def model_post_init(self, _context):
-        if self.domain is None:
-            self.domain = _domain(self.url)
-
-        if self.publisher is None:
-            self.publisher = self.domain
-
-    @property
-    def fingerprint(self):
-        """The identifying part of a source — never the retrieval date."""
-        return self.url or f"{self.publisher or ''}|{self.title or ''}"
+    return stable_id("ev", claim_id or "", source_type, fingerprint)
 
 
-def evidence_id(evidence_type, source=None, text=""):
+class EvidenceCandidate(BaseModel):
     """
-    Deterministic id for a piece of evidence: the URL identifies it when
-    there is one (the same fact-check retrieved twice is one node), else
-    the publisher + title + text. The retrieval date is deliberately
-    excluded so re-running retrieval does not fork the graph.
-    """
-    fingerprint = source.fingerprint if source is not None else ""
+    One retrieved item, before anyone has decided what it means.
 
-    return stable_id("ev", evidence_type, fingerprint, (text or "")[:200])
-
-
-class Evidence(BaseModel):
-    """
-    One retrieved item that bears on a claim.
-
-    `relevance` is how well the item matches the claim; `credibility` is
-    how much the source is worth trusting. They stay separate so stage 4
-    can weigh "a spot-on match from a random blog" differently from "a
-    loose match from PIB". `match` records *why* the retriever returned
-    this item (query string, cosine distance, matched pattern) so a
-    verdict can be explained rather than asserted.
+    `decisive` marks the narrow case the verdict trusts on its own: a
+    fact-checker's rating of a claim that closely matches this one. It is
+    set in `normalize.py`, never by a retriever.
     """
 
     id: str = ""
-    evidence_type: str = "other"            # one of EVIDENCE_TYPES
-    text: str = ""                          # snippet / quote bearing on the claim
-    source: EvidenceSource = Field(default_factory=EvidenceSource)
+    claim_id: str
+    source_type: str                              # one of SOURCE_TYPES
+    query: Optional[str] = None                   # what we asked to find it
 
-    relation: str = "uncertain"             # one of RELATIONS
-    relevance: float = Field(default=0.5, ge=0.0, le=1.0)
-    credibility: float = Field(default=0.5, ge=0.0, le=1.0)
+    url: Optional[str] = None
+    domain: Optional[str] = None                  # derived from `url`
+    title: Optional[str] = None
+    snippet: Optional[str] = None
+    text: Optional[str] = None                    # full article body, if fetched
 
-    match: dict = {}                        # why this was retrieved
+    publisher: Optional[str] = None
+    rating: Optional[str] = None                  # normalised: one of RATINGS
+    rating_raw: Optional[str] = None              # exactly what the publisher said
+    published_date: Optional[str] = None          # ISO, when known
+    retrieved_at: Optional[str] = None            # ISO date we fetched it
+
+    source_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+    decisive: bool = False
+    stance: Optional[str] = None                  # stage 4 fills this in
+
+    language: Optional[str] = None
+    score: Optional[float] = None                 # retriever's own relevance, if any
+    demo: bool = False                            # from the demo seed index
     meta: dict = {}
 
     def model_post_init(self, _context):
-        if self.evidence_type not in EVIDENCE_TYPES:
+        if self.source_type not in SOURCE_TYPES:
             raise ValueError(
-                f"unknown evidence_type {self.evidence_type!r}; "
-                f"expected one of {EVIDENCE_TYPES}"
+                f"unknown source_type {self.source_type!r}; expected one of {SOURCE_TYPES}"
             )
 
-        if self.relation not in RELATIONS:
+        if self.rating is not None and self.rating not in RATINGS:
             raise ValueError(
-                f"unknown relation {self.relation!r}; expected one of {RELATIONS}"
+                f"unknown rating {self.rating!r}; expected one of {RATINGS}"
             )
+
+        if self.url and not self.domain:
+            self.domain = domain_of(self.url)
+
+        if self.url:
+            self.url = canonical_url(self.url)
 
         if not self.id:
-            self.id = evidence_id(self.evidence_type, self.source, self.text)
-
-    @property
-    def weight(self):
-        """Relevance tempered by credibility — a convenience for stage 4."""
-        return round(self.relevance * self.credibility, 4)
-
-    def to_node(self):
-        """The `evidence` graph node for this item."""
-        return Node(
-            id=self.id,
-            kind="evidence",
-            attrs={
-                "evidence_type": self.evidence_type,
-                "text": self.text,
-                "relation": self.relation,
-                "relevance": self.relevance,
-                "credibility": self.credibility,
-                "url": self.source.url,
-                "title": self.source.title,
-                "publisher": self.source.publisher,
-                "domain": self.source.domain,
-                "published": self.source.published,
-                "retrieved": self.source.retrieved,
-                "rating": self.source.rating,
-                "match": self.match,
-                "meta": self.meta,
-            },
-        )
-
-
-class EvidenceRelation(BaseModel):
-    """A claim <-> evidence verdict link, kept alongside the edge it produced."""
-
-    claim_id: str
-    evidence_id: str
-    relation: str                       # one of RELATIONS
-    relevance: float = Field(default=0.5, ge=0.0, le=1.0)
-    credibility: float = Field(default=0.5, ge=0.0, le=1.0)
-    note: Optional[str] = None
-
-    def model_post_init(self, _context):
-        if self.relation not in RELATIONS:
-            raise ValueError(
-                f"unknown relation {self.relation!r}; expected one of {RELATIONS}"
+            self.id = candidate_id(
+                self.claim_id, self.source_type,
+                url=self.url, title=self.title, snippet=self.snippet,
             )
 
     @property
-    def edge_type(self):
-        return RELATION_EDGES[self.relation]
+    def body(self):
+        """Title, snippet and full text joined, longest-wins, for stage 4."""
+        parts = [p.strip() for p in (self.title, self.snippet, self.text) if (p or "").strip()]
+        kept = []
 
-    @property
-    def key(self):
-        return (self.claim_id, self.evidence_id)
+        for index, part in enumerate(parts):
+            if any(part in longer and part != longer for longer in parts[index + 1:]):
+                continue
 
+            if part not in kept:
+                kept.append(part)
 
-class Node(BaseModel):
-    id: str
-    kind: str          # one of NODE_KINDS
-    attrs: dict = {}   # everything else, flattened on the wire
+        return "\n".join(kept)
 
-    def get(self, key, default=None):
-        return self.attrs.get(key, default)
-
-    def to_dict(self):
-        return {"id": self.id, "kind": self.kind, **self.attrs}
-
-    @classmethod
-    def from_dict(cls, data):
-        attrs = dict(data)
-        node_id = attrs.pop("id")
-        kind = attrs.pop("kind")
-
-        return cls(id=node_id, kind=kind, attrs=attrs)
-
-
-class Edge(BaseModel):
-    """
-    A directed edge. `src` / `dst` serialise as "from" / "to" to match the
-    seed produced by ClaimSet.to_graph_seed().
-    """
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    src: str = Field(alias="from")
-    dst: str = Field(alias="to")
-    type: str          # one of EDGE_TYPES
-    attrs: dict = {}   # via, relation, relevance, ...
-
-    @property
-    def key(self):
-        """Identity of an edge: the same triple + `via` is one edge."""
-        return (self.src, self.dst, self.type, self.attrs.get("via"))
-
-    def get(self, key, default=None):
-        return self.attrs.get(key, default)
-
-    def to_dict(self):
-        return {"from": self.src, "to": self.dst, "type": self.type, **self.attrs}
-
-    @classmethod
-    def from_dict(cls, data):
-        attrs = dict(data)
-        src = attrs.pop("from", None) or attrs.pop("src")
-        dst = attrs.pop("to", None) or attrs.pop("dst")
-        edge_type = attrs.pop("type")
-
-        return cls(src=src, dst=dst, type=edge_type, attrs=attrs)
+    def to_stance_input(self):
+        """The flat shape `backend.stance` consumes."""
+        return {
+            "id": self.id,
+            "claim_id": self.claim_id,
+            "title": self.title,
+            "snippet": self.snippet,
+            "text": self.text,
+            "rating": self.rating_raw or self.rating,
+            "weight": self.source_weight,
+        }

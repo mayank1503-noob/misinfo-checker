@@ -1,37 +1,44 @@
 """
-Stage 3A — the evidence graph.
+Stage 3b — text evidence retrieval.
 
-Grows the packet / claim / entity skeleton produced by
-`ClaimSet.to_graph_seed()` with evidence nodes and stance edges. Data
-layer only: retrieval (3B) and the verdict (4) live elsewhere.
+Finds things that bear on each check-worthy claim, normalises them into
+`EvidenceCandidate`s, and writes them into the evidence graph. It does
+not decide what any of it *means*: every candidate leaves here with
+`stance=None`, and stage 4 (`backend.stance`) reads the text and judges.
+
+    from backend.evidence import collect_evidence
+
+    report = collect_evidence(claimset, graph)
+
+Runs with no API keys: the local seed index answers offline, and the two
+network retrievers log once and return nothing when their key is unset.
 """
 
-from .graph import EvidenceGraph
+from .collector import CollectionReport, collect_evidence, retrieve_for_claim
+from .normalize import normalize_candidates, normalize_rating, tier_for, weight_for
+from .queries import Query, build_queries, queries_for
 from .schema import (
-    EDGE_TYPES,
-    EVIDENCE_TYPES,
-    NODE_KINDS,
-    RELATION_EDGES,
-    RELATIONS,
-    Edge,
-    Evidence,
-    EvidenceRelation,
-    EvidenceSource,
-    Node,
-    evidence_id,
+    RATINGS,
+    SOURCE_TYPES,
+    EvidenceCandidate,
+    canonical_url,
+    domain_of,
 )
 
 __all__ = [
-    "EvidenceGraph",
-    "Evidence",
-    "EvidenceSource",
-    "EvidenceRelation",
-    "Node",
-    "Edge",
-    "evidence_id",
-    "NODE_KINDS",
-    "EDGE_TYPES",
-    "EVIDENCE_TYPES",
-    "RELATIONS",
-    "RELATION_EDGES",
+    "EvidenceCandidate",
+    "SOURCE_TYPES",
+    "RATINGS",
+    "canonical_url",
+    "domain_of",
+    "Query",
+    "build_queries",
+    "queries_for",
+    "normalize_candidates",
+    "normalize_rating",
+    "tier_for",
+    "weight_for",
+    "collect_evidence",
+    "retrieve_for_claim",
+    "CollectionReport",
 ]

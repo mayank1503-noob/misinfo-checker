@@ -1,0 +1,108 @@
+# Source credibility tiers.
+#
+# Every retrieved item is weighted by the domain it came from, and that
+# weight multiplies its stance when the verdict adds support and refutation
+# up (see backend/graph/store.py: stance_totals). The tiers are coarse on
+# purpose — this is "how much benefit of the doubt does this domain get",
+# not a precision instrument, and a transparent table beats a tuned number
+# nobody can argue with.
+#
+# Matching is on the registered domain, with `www.` stripped, and a
+# subdomain inherits its parent's tier (factcheck.pib.gov.in -> pib.gov.in)
+# unless it is listed in its own right.
+
+tiers:
+  factchecker: 1.0   # IFCN signatories and PIB Fact Check
+  government: 0.9    # official ministries, regulators, statutory bodies
+  news: 0.8          # established newsrooms with corrections policies
+  other: 0.5         # anything unrecognised — the default
+  blog: 0.3          # blogs, forums, social platforms, content farms
+
+default_tier: other
+
+# Fact-checkers whose published rating is treated as decisive when it
+# matches a claim closely (see backend/evidence/normalize.py).
+domains:
+  factchecker:
+    - altnews.in
+    - boomlive.in
+    - factchecker.in
+    - factcrescendo.com
+    - thequint.com/webqoof
+    - newschecker.in
+    - vishvasnews.com
+    - indiatoday.in/fact-check
+    - digiteye.in
+    - thip.media
+    - fact-crescendo.com
+    - pib.gov.in            # PIB Fact Check is the government's own unit
+    - factcheck.pib.gov.in
+    - snopes.com
+    - politifact.com
+    - fullfact.org
+    - afp.com
+    - reuters.com/fact-check
+
+  government:
+    - india.gov.in
+    - rbi.org.in
+    - npci.org.in
+    - sebi.gov.in
+    - trai.gov.in
+    - uidai.gov.in
+    - incometax.gov.in
+    - mohfw.gov.in
+    - icmr.gov.in
+    - nic.in
+    - gov.in
+    - who.int
+    - un.org
+    - cowin.gov.in
+    - epfindia.gov.in
+    - irctc.co.in
+    - cert-in.org.in
+
+  news:
+    - thehindu.com
+    - indianexpress.com
+    - hindustantimes.com
+    - timesofindia.indiatimes.com
+    - ndtv.com
+    - bbc.com
+    - bbc.co.uk
+    - scroll.in
+    - thewire.in
+    - theprint.in
+    - livemint.com
+    - business-standard.com
+    - economictimes.indiatimes.com
+    - deccanherald.com
+    - telegraphindia.com
+    - news18.com
+    - indiatoday.in
+    - aajtak.in
+    - amarujala.com
+    - jagran.com
+    - bhaskar.com
+    - moneycontrol.com
+    - thenewsminute.com
+
+  blog:
+    - blogspot.com
+    - wordpress.com
+    - medium.com
+    - substack.com
+    - quora.com
+    - reddit.com
+    - facebook.com
+    - twitter.com
+    - x.com
+    - instagram.com
+    - youtube.com
+    - tiktok.com
+    - whatsapp.com
+    - t.me
+    - telegram.me
+    - sharechat.com
+    - opindia.com
+    - tfipost.com

@@ -601,7 +601,19 @@ class EvidenceGraph:
                 }
             )
 
-        found.sort(key=lambda item: (-item["weighted"], item["id"]))
+        # Decisive first, then the weighted stance, then the credibility of
+        # the source. The last two tiers matter before stage 4 has run:
+        # every stance is None then, so every weighted score is 0, and
+        # without them the listing would fall back to id order and bury
+        # the fact-check that settles the claim under a loose match.
+        found.sort(
+            key=lambda item: (
+                0 if item.get("decisive") else 1,
+                -item["weighted"],
+                -float(item.get("source_weight") or 0.0),
+                item["id"],
+            )
+        )
 
         return found
 
