@@ -118,14 +118,25 @@ def process_message(text, analyze=None, **kwargs):
             "reply": "Send me a message, a link, or a screenshot and I'll check it.",
         }
 
+    body = text.strip()
+    route = message_type
+
+    if message_type == "link" and _has_text_beyond_urls(body):
+        # A forward that *contains* a link is still mostly a message, and
+        # the claims are in the words around the link, not in whatever
+        # the link resolves to. Routing the whole thing to the article
+        # fetcher throws the message away - and these links are usually
+        # the scam's own landing page, which is not evidence about
+        # anything. Only a message that is essentially just a URL gets
+        # treated as a link to go and read.
+        route = "text"
+
     if analyze is None:
         from ..pipeline import analyze_link, analyze_text
 
-        analyze = analyze_link if message_type == "link" else analyze_text
+        analyze = analyze_link if route == "link" else analyze_text
 
-    body = text.strip()
-
-    if message_type == "link":
+    if route == "link":
         body = _first_url(body) or body
 
     try:
@@ -148,12 +159,28 @@ def process_message(text, analyze=None, **kwargs):
     return {
         "status": "checked",
         "input_type": message_type,
+        "routed_as": route,
         "text": text.strip(),
         "label": verdict.get("label", "unverified"),
         "confidence": verdict.get("confidence", 0.0),
         "reply": format_reply(result),
         "result": result,
     }
+
+
+# Enough words around a link to mean the message is a message, not just
+# a shared URL.
+MIN_WORDS_BESIDE_A_LINK = 5
+
+
+def _has_text_beyond_urls(text):
+    """Whether a message says anything besides the link it carries."""
+    words = [
+        word for word in (text or "").split()
+        if not word.strip().lower().startswith(("http://", "https://", "www."))
+    ]
+
+    return len(words) >= MIN_WORDS_BESIDE_A_LINK
 
 
 def _first_url(text):

@@ -655,6 +655,55 @@ def test_bot_ignores_an_empty_message():
     assert result["reply"]
 
 
+def test_bot_checks_the_message_when_a_link_is_only_part_of_it():
+    """
+    A forward that carries a link is still a message.
+
+    The claims are in the words around the link; the link itself is
+    usually the scam's own landing page. Sending the whole thing to the
+    article fetcher used to throw the message away and report that no
+    claim was found.
+    """
+    from backend.bot.guardian_bot import process_message
+
+    seen = {}
+
+    def fake(body, **kwargs):
+        seen["body"] = body
+
+        return {"verdict": {"label": "false", "claims": [
+            {"claim": "SBI is giving Rs 5,000 cashback.", "label": "false",
+             "explanation": "...", "reasons": [], "demo_only": False},
+        ]}}
+
+    message = (
+        "SBI is giving Rs 5,000 cashback to every customer today. "
+        "Register now at http://sbi-cashback-offer.example to claim it."
+    )
+    result = process_message(message, analyze=fake)
+
+    assert result["input_type"] == "link"       # it does contain one
+    assert result["routed_as"] == "text"        # but it is checked as a message
+    assert seen["body"] == message
+    assert result["label"] == "false"
+
+
+def test_bot_routes_a_bare_link_to_the_link_analyzer():
+    from backend.bot.guardian_bot import process_message
+
+    seen = {}
+
+    def fake(url, **kwargs):
+        seen["url"] = url
+
+        return {"verdict": {"label": "unverified", "claims": []}}
+
+    result = process_message("https://example.com/story", analyze=fake)
+
+    assert result["routed_as"] == "link"
+    assert seen["url"] == "https://example.com/story"
+
+
 def test_bot_routes_a_link_and_normalises_a_bare_www():
     from backend.bot.guardian_bot import process_message
 
@@ -665,9 +714,10 @@ def test_bot_routes_a_link_and_normalises_a_bare_www():
 
         return {"verdict": {"label": "unverified", "claims": []}}
 
-    result = process_message("check this www.example.com/story please", analyze=fake)
+    result = process_message("look www.example.com/story", analyze=fake)
 
     assert result["input_type"] == "link"
+    assert result["routed_as"] == "link"       # too few words to be a message
     assert seen["url"] == "https://www.example.com/story"
 
 
