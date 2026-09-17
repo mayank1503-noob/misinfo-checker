@@ -906,7 +906,17 @@ class EvidenceGraph:
             return None
 
         try:
-            network = Network(height=height, directed=True, notebook=notebook)
+            # cdn_resources="in_line" embeds vis.js in the file itself: one
+            # self-contained page that works offline. The default ("local")
+            # copies a `lib/` tree into the *working* directory, which
+            # pollutes the repo and leaves the written file pointing at
+            # scripts that are not next to it.
+            network = Network(
+                height=height,
+                directed=True,
+                notebook=notebook,
+                cdn_resources="in_line",
+            )
 
             for node_id, attrs in self.g.nodes(data=True):
                 kind = attrs.get("kind", "packet")
@@ -933,9 +943,13 @@ class EvidenceGraph:
             if directory:
                 os.makedirs(directory, exist_ok=True)
 
-            # write_html rather than show(): show() opens a browser, which
-            # is wrong on a server and hangs a test run.
-            network.write_html(path, notebook=notebook, open_browser=False)
+            # generate_html + our own write, rather than write_html():
+            # show() opens a browser (wrong on a server, hangs a test run)
+            # and write_html() opens the file with the platform's default
+            # encoding, which throws UnicodeEncodeError on Windows the
+            # moment a node label contains Devanagari or an em dash.
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(network.generate_html(notebook=notebook))
 
             return path
         except Exception as error:                     # fail soft, never raise

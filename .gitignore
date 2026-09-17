@@ -7,3 +7,7 @@ __pycache__/
 *.mp3
 cache/
 .vscode/
+
+# pyvis scratch output
+lib/
+*.html
