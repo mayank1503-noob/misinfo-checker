@@ -4,147 +4,148 @@ _Last updated: 2026-09-17_
 
 ## What this project is
 
-A misinformation detection service for text, links, images, and videos (with a
-WhatsApp/Telegram-style "guardian bot" front door). The backend is a FastAPI app;
-the analysis pipeline lives in `backend/analyzers/`.
+A misinformation detection service for forwarded text, links, images and videos, with a
+WhatsApp/Telegram-style "guardian bot" front door. FastAPI backend; the analysis runs as
+a staged pipeline where each stage produces a typed object the next one consumes.
 
-## What is happening right now
+## Where it stands
 
-**Every request to the API returns the raw "media packet" instead of a verdict.**
-
-Example — `POST /check/text` with `{"text": "Free UPI cashback, forward to 10 people"}`:
-
-```json
-{
-  "packet": {
-    "input_type": "text",
-    "text": "Free UPI cashback, forward to 10 people",
-    "source_date": null,
-    "images": []
-  },
-  "results": []
-}
-```
-
-`results` is always an empty list. No claim, no fact-check, no score, no verdict.
-
-## Why: the pipeline stops after Stage 1
-
-The system was designed as a multi-stage pipeline, but only the first stage
-(building a normalized "packet" from whatever the user sent) is implemented.
+**Every stage is built, tested and wired together.** `POST /check/text` returns a
+verdict with the evidence behind it, not the raw packet.
 
 ```
 User input (text / link / image / video)
         │
         ▼
-┌────────────────────────────────────────────┐
-│ Stage 1 — Ingest → packet   (IMPLEMENTED)  │
-│   backend/analyzers/packet.py              │
-│   - from_text   → text as-is               │
-│   - from_link   → trafilatura + htmldate   │
-│   - from_image  → OCR, BLIP caption,       │
-│                   DINOv2 embedding, EXIF,  │
-│                   AI-generated score       │
-│   - from_video  → ffmpeg audio → Whisper,  │
-│                   keyframes → image.analyze│
-└────────────────────────────────────────────┘
-        │  packet = {input_type, text, source_date, images}
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 1 — Ingest → MediaPacket            (IMPLEMENTED)      │
+│   backend/analyzers/   text, link, image, video keyframes    │
+└──────────────────────────────────────────────────────────────┘
+        ▼  {input_type, text, source_date, images[]}
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 2 — Claim extraction → ClaimSet     (IMPLEMENTED)      │
+│   backend/claims/      regex / transformer / ollama backends │
+└──────────────────────────────────────────────────────────────┘
+        ▼  to_graph_seed()
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 3a — Evidence graph                 (IMPLEMENTED)      │
+│   backend/graph/       NetworkX MultiDiGraph: packet, claim, │
+│   entity, image, evidence, source, date, verdict nodes;      │
+│   15 edge types; deterministic ids; idempotent adds;         │
+│   timeline, stance totals, decisive hits, pyvis export       │
+└──────────────────────────────────────────────────────────────┘
         ▼
-┌────────────────────────────────────────────┐
-│ Stage 2 — Claim extraction  (IMPLEMENTED)  │
-│   backend/claims/  -> ClaimSet             │
-│   sentences -> entities/time -> score ->   │
-│   type -> dedupe -> to_graph_seed()        │
-│   NOT yet called from main.py              │
-└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 3b — Evidence retrieval             (IMPLEMENTED)      │
+│   backend/evidence/    Google Fact Check + Tavily + a local  │
+│   FAISS seed index; claim-type routed queries, Hindi too;    │
+│   rating normalisation, domain credibility, dedupe, cap      │
+│   Retrieval only — every candidate leaves with stance=None   │
+└──────────────────────────────────────────────────────────────┘
         ▼
-┌────────────────────────────────────────────┐
-│ Stage 3A — Evidence graph   (IMPLEMENTED)  │
-│   backend/evidence/  -> EvidenceGraph      │
-│   to_graph_seed() -> packet/claim/entity   │
-│   nodes + evidence nodes, HAS_EVIDENCE and │
-│   SUPPORTS / REFUTES / UNCERTAIN_FOR edges │
-│   data layer only; NOT called from main.py │
-├────────────────────────────────────────────┤
-│ Stage 3B — Evidence retrieval /            │
-│            fact-check lookup   (MISSING)   │
-│   nothing produces Evidence objects yet    │
-└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 5 — Image evidence                  (IMPLEMENTED)      │
+│   backend/images/      keyframe dedupe, local DINOv2 index,  │
+│   SerpAPI reverse search, CLIP caption consistency           │
+│   Reuses stage 1's embeddings — nothing is recomputed        │
+└──────────────────────────────────────────────────────────────┘
         ▼
-┌────────────────────────────────────────────┐
-│ Stage 4 — Scoring + verdict  (MISSING)     │
-└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 4 — Stance                          (IMPLEMENTED)      │
+│   backend/stance/      passages → rank → NLI; a publisher's  │
+│   rating overrides the model; writes SUPPORTS / REFUTES /    │
+│   NEUTRAL edges back into the graph                          │
+└──────────────────────────────────────────────────────────────┘
         ▼
-   API response  →  currently just {packet, results: []}
+┌──────────────────────────────────────────────────────────────┐
+│ Verdict                                   (IMPLEMENTED)      │
+│   backend/verdict.py   decisive fact-check > recycled image  │
+│   > weighted stance > unverified. Rules, not a model.        │
+└──────────────────────────────────────────────────────────────┘
+        ▼
+   API response / bot reply, with reasons and sources
 ```
 
-In `backend/api/main.py`, both endpoints literally do:
+Example — `POST /check/text` with a UPI cashback forward, no API keys set:
 
-```python
-packet = from_text(text)      # or from_link(url)
-return {"packet": packet, "results": []}
+```json
+{
+  "verdict": {
+    "label": "false",
+    "confidence": 0.72,
+    "summary": "This message contains a false claim. A fact-checker has already
+                checked this claim. Demo Fact Check Archive rated it false on
+                2024-03-11  [demo data]"
+  },
+  "results": [
+    {
+      "claim": "SBI is giving Rs 5,000 cashback to every customer today.",
+      "label": "false",
+      "confidence": 0.72,
+      "reasons": ["Demo Fact Check Archive rated it false on 2024-03-11 ..."],
+      "evidence_ids": ["ev_..."],
+      "demo_only": true
+    }
+  ],
+  "timeline": [...],
+  "stages": {"claims": {...}, "evidence": {...}, "stance": {...}, "verdict": {...}}
+}
 ```
 
-`results` is hard-coded to `[]`. The claim extractor (`backend.claims.extract_claims`)
-exists and is tested, but nothing in the API or bot calls it yet.
+## What runs with nothing installed and no keys
 
-## What the packet contains (per input type)
+| | Without keys / models | With them |
+|---|---|---|
+| Claim extraction | regex backend | + transformer NER and zero-shot typing |
+| Retrieval | local seed index (32 demo fact-checks) | + Google Fact Check, Tavily |
+| Stance | everything neutral, `method="unavailable"` | passage ranking + NLI |
+| Images | EXIF dates only | + DINOv2 index, CLIP captions, reverse search |
+| Verdict | mostly `unverified` | the full rule set |
 
-| Field         | text  | link                          | image                   | video                                  |
-|---------------|-------|-------------------------------|-------------------------|----------------------------------------|
-| `input_type`  | text  | link                          | image                   | video                                  |
-| `text`        | input | article body (trafilatura)    | caption                 | caption + Whisper transcript           |
-| `source_date` | null  | published date (htmldate)     | null                    | null                                   |
-| `images`      | []    | []                            | 1 analyzed image        | up to 6 keyframes, each analyzed       |
+Nothing raises in either column. Every external call is cached under `cache/` and fails
+soft.
 
-Each analyzed image (`image.analyze`) is:
-`{path, ocr_text, description, embedding (768-d DINOv2), exif_date, ai_generated_score, frame_time}`.
+## Tests
 
-## Other gaps found while reviewing
+246 tests, about 5 seconds, entirely offline — `backend/tests/conftest.py` blocks the
+HTTP helpers for every test and the models are stubbed.
 
-| Area | Issue |
-|------|-------|
-| `backend/api/main.py` | Only `/check/text` and `/check/link` exist. No `/check/image` or `/check/video` endpoints, even though `from_image`, `from_video`, `from_video_url` are implemented. |
-| `backend/bot/guardian_bot.py` | `process_message` only classifies the message (`text` / `link` / `empty`) and echoes it back. It never calls the analyzers or the API. |
-| `backend/bot/filters.py` | `contains_url` matches `"www."` but `/check/link` rejects anything not starting with `http(s)://`. |
-| `backend/samples/*.txt` | All five sample files are **empty** (0 bytes). |
-| `backend/data/`, `backend/evaluation/`, `frontend/` | Empty directories. |
-| `.env` | Empty. `AI_DETECTOR_MODEL` is read from env but never set, so `ai_generated_score` is always `null`. |
-| `requirements.txt` | Now includes `trafilatura`, `htmldate`, `pytest`. Still missing the image/video stack: `Pillow`, `easyocr`, `openai-whisper`, `transformers`, `torch`, `yt-dlp`. ffmpeg must also be on PATH. |
-| `venv/` | Broken: `pyvenv.cfg` points at a Python install under another user's home directory. Recreate with `python -m venv venv`. |
-| `backend/analyzers/video.py` | Uses `tempfile.mktemp` (deprecated/racy) and never cleans up keyframe dirs or downloaded videos. |
-| `backend/analyzers/models.py` | `blip()` uses the `image-text-to-text` pipeline task with `blip-image-captioning-base`; that model is normally loaded with `image-to-text`. Worth verifying it loads. |
+| File | Covers |
+|---|---|
+| `test_claims.py`, `test_claims_transformer.py` | stages 1–2 (pre-existing) |
+| `test_graph_store.py` | stage 3a: construction, images, evidence, stance, duplicates, dates, serialisation, pyvis |
+| `test_evidence_retrieval.py` | stage 3b: queries, ratings, credibility, dedupe, all three retrievers, fetching, the collector, the cache |
+| `test_stance.py`, `test_stance_graph_adapter.py` | stage 4: chunking, ranking, NLI, rating override, the graph adapter |
+| `test_images.py` | stage 5: keyframes, local index, CLIP, reverse search, the collector |
+| `test_pipeline.py` | the verdict rules, the pipeline, the API, the bot |
+| `test_evidence_graph.py` | the compatibility shim for the moved module |
 
-## What needs to happen to get a real output
+Two integration tests run against the real models behind `CLAIM_TESTS_WITH_MODELS=1`
+and `STANCE_TESTS_WITH_MODELS=1`.
 
-1. ~~**Claim extraction**~~ — done: `backend/claims/` (see README). Heuristic baseline;
-   a model-backed extractor can be swapped in behind the same `ClaimSet` schema.
-2. ~~**Evidence graph**~~ — done: `backend/evidence/` (Stage 3A, see README).
-   `EvidenceGraph.from_claimset()` + `add_evidence` / `add_relation` /
-   `get_claim_evidence` / `to_dict`. No retrieval yet.
-3. **Evidence / fact-check retrieval (3B)** — e.g. Google Fact Check Tools API, a local
-   index of known scams/rumors (`backend/data/`), reverse-image lookup using the
-   DINOv2 embeddings, date comparison (`source_date` / `exif_date`) for recycled content.
-4. **Scoring + verdict** — combine signals (fact-check matches, AI-generated score,
-   recycled-media flag, scam patterns like fake UPI) into a label
-   (`true` / `false` / `misleading` / `unverified`) with a confidence and explanation.
-5. **Wire it up** — replace `"results": []` in `main.py` with the verdict, add
-   `/check/image` and `/check/video`, and have `guardian_bot.process_message`
-   call the pipeline.
-6. **Fill in samples** and build `backend/evaluation/` so the five sample cases
-   (`fake_upi`, `hinglish_rumor`, `personal_chat`, `recycled_rumor`, `true_claim`)
-   can be run as a regression check.
+## Gaps that were closed
 
-## How to run what exists
+| Was | Now |
+|---|---|
+| `results` hard-coded to `[]` | a verdict per claim, with reasons and sources |
+| No `/check/image` or `/check/video` | both, plus `/check/packet` and a richer `/health` |
+| `guardian_bot` echoed the message | runs the pipeline and replies with a verdict |
+| `contains_url` accepted bare `www.` that `/check/link` rejected | the bot normalises it to `https://` before fetching |
+| The five `backend/samples/*.txt` were empty | filled with a scam, a Hinglish rumour, personal chat, a recycled-image claim and a true claim |
+| `README.md` was empty | documents every stage |
+| `requirements.txt` missing the image/video stack | networkx, pyvis, PyYAML, faiss-cpu, sentence-transformers, numpy, Pillow, torchvision added |
 
-```powershell
-python -m venv venv
-.\venv\Scripts\activate
-pip install -r requirements.txt
-pytest                                   # 54 tests: claim extraction + evidence graph
-uvicorn backend.api.main:app --reload
-# then POST to http://127.0.0.1:8000/check/text or /check/link
-```
+## Still open
 
-Image/video paths additionally need `Pillow easyocr openai-whisper transformers torch yt-dlp`
-and ffmpeg on PATH.
+- `venv/` is still broken: `pyvenv.cfg` points at a Python install under another user's
+  home directory. Recreate it with `python -m venv venv`. Everything here was run on the
+  system interpreter.
+- `backend/analyzers/video.py` still uses `tempfile.mktemp` and never cleans up keyframe
+  directories or downloaded videos.
+- `backend/analyzers/models.py` loads BLIP through the `image-text-to-text` pipeline
+  task; that checkpoint is normally loaded with `image-to-text`. Untested here — the
+  image tests supply descriptions directly.
+- `backend/evaluation/` is still empty. The samples now have content, so a harness that
+  asserts expected labels per sample is the obvious next piece.
+- Romanised Hinglish retrieval, and stage 2 scoring personal chat as check-worthy. See
+  DECISIONS.md, open issues.

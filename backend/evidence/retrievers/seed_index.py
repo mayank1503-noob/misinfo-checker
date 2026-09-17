@@ -232,6 +232,22 @@ def _entry_to_candidate(entry, claim_id, query, similarity):
     )
 
 
+def warm_up(path=None):
+    """
+    Embed the corpus now, on the calling thread.
+
+    The collector calls this before it starts its thread pool: loading a
+    sentence-transformer inside a worker thread has crashed outright on
+    Windows, and the embedding has to happen once either way.
+    """
+    if not os.path.exists(index_path()):
+        return False
+
+    _entries, matrix = _vectors(path)
+
+    return matrix is not None
+
+
 def search(claim_id, query, top_k=TOP_K, floor=SIMILARITY_FLOOR, path=None):
     """
     The closest seed entries to a query, as candidates.

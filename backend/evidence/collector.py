@@ -69,6 +69,32 @@ class CollectionReport(NamedTuple):
         }
 
 
+def warm_up(retrievers=None):
+    """
+    Load whatever the retrievers need *before* the thread pool starts.
+
+    The seed index loads a sentence-transformer the first time it is
+    asked for anything. Doing that inside a worker thread is a good way
+    to crash: torch's weight materialisation is itself threaded, and on
+    Windows the nested pools have produced both access violations and
+    hard aborts. Loading on the calling thread costs the same seconds and
+    is safe, and every later call is an `lru_cache` hit.
+
+    Failures are swallowed: this is an optimisation, and the retriever's
+    own `available()` check is what actually decides whether it runs.
+    """
+    for name, module in (retrievers or RETRIEVERS).items():
+        loader = getattr(module, "warm_up", None)
+
+        if loader is None:
+            continue
+
+        try:
+            loader()
+        except Exception as error:                   # fail soft, never raise
+            log.debug("warm-up of %s failed (%s): %s", name, type(error).__name__, error)
+
+
 def _run_retriever(name, module, claim_id, claim_queries):
     """One retriever's results for one claim, or [] plus an error string."""
     try:
@@ -98,6 +124,8 @@ def retrieve_for_claim(claim, max_queries=query_builder.MAX_QUERIES,
 
     if not claim_queries:
         return [], {}, []
+
+    warm_up(retrievers)
 
     found = []
     counts = {}
@@ -149,6 +177,11 @@ def collect_evidence(claimset, graph=None, max_queries=query_builder.MAX_QUERIES
 
     if not claims:
         return CollectionReport(**report)
+
+    # Before *either* pool starts. Both are thread pools, and loading a
+    # torch model inside one has crashed the process outright on Windows;
+    # the per-claim warm-up below would already be running in a worker.
+    warm_up(retrievers)
 
     # Claims are searched in parallel too: with three retrievers each
     # already running concurrently, the pool is mostly waiting on sockets.
