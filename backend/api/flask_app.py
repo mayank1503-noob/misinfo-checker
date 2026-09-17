@@ -99,7 +99,11 @@ def page_assets(frontend):
 
 
 def create_app(frontend=FRONTEND):
-    app = Flask(__name__, static_folder=None)
+    app = Flask(
+    __name__,
+    static_folder=None,
+    template_folder=os.path.join(os.path.dirname(__file__), "templates"),
+)
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
     frontend = os.path.abspath(frontend)
