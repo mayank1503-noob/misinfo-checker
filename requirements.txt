@@ -27,3 +27,4 @@ numpy
 # stage 5: image evidence
 Pillow                                   # image loading, demo placeholder images
 torchvision                              # required by DINOv2's image processor
+gunicorn
