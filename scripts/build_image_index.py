@@ -13,10 +13,11 @@ A real deployment would seed `data/seed_images/` with actual images whose
 provenance is known. This script does not download anything by default:
 fetching arbitrary pictures from the internet is slow, breaks without a
 network, and would put files of unclear licence into the repository.
-Instead it *generates* placeholder images — flat coloured cards with the
-scenario printed on them — one per entry in a small scenario list. They
-are visually distinct, so DINOv2 gives each a stable and well-separated
-embedding, which is all the index needs to be demonstrable end to end.
+Instead it *generates* placeholder images — seeded noise textures with the
+scenario printed on them — one per entry in a small scenario list. The
+texture matters: flat cards embed too close together for the index to
+tell them apart (see the comment in `generate`), while these separate
+cleanly, which is all the index needs to be demonstrable end to end.
 
 Everything it writes is marked `"demo": true`, and matches carry that
 flag all the way to the verdict. Point `--dir` at real images with a real
@@ -32,6 +33,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 
 
@@ -143,10 +145,11 @@ def generate(directory):
     never overwritten by a placeholder.
     """
     try:
-        from PIL import Image, ImageDraw
+        import numpy
+        from PIL import Image, ImageDraw, ImageFilter
     except ImportError:
-        print("Pillow is not installed; cannot generate placeholder images.")
-        print("Install it (pip install Pillow) or point --dir at real images.")
+        print("Pillow and numpy are needed to generate placeholder images.")
+        print("Install them, or point --dir at real images.")
         return 0
 
     os.makedirs(directory, exist_ok=True)
@@ -158,20 +161,37 @@ def generate(directory):
         if os.path.exists(path):
             continue
 
-        image = Image.new("RGB", SIZE, scenario["colour"])
+        # Flat colour cards are *not* enough, and nor are cards with
+        # shapes on them. DINOv2 embeds synthetic images of either kind
+        # very close together - much closer than two real photographs -
+        # and the first version of this script produced placeholders that
+        # matched *each other* above the index floor, so one picture
+        # "matched" three archive entries at once.
+        #
+        # What separates them is texture. Each card is built from its own
+        # seeded noise field, blurred into blobs and tinted, which gives
+        # DINOv2 the per-image statistics a real photograph would have.
+        # Measured over the eight scenarios: distinct cards peak at 0.92
+        # cosine, while the same card recompressed as JPEG scores 0.98 -
+        # which is the gap the 0.95 floor in local_index.py sits in.
+        rng = random.Random(scenario["file"])
+        noise = numpy.random.default_rng(index).integers(
+            0, 256, (SIZE[1], SIZE[0], 3), dtype=numpy.uint8
+        )
+
+        image = Image.fromarray(noise).filter(
+            ImageFilter.GaussianBlur(radius=3 + index % 5)
+        )
+        image = Image.blend(image, Image.new("RGB", SIZE, scenario["colour"]), 0.35)
+
         draw = ImageDraw.Draw(image)
 
-        # Distinct geometry per entry as well as distinct colour: two flat
-        # colour fields can embed closer together than two real
-        # photographs would, and the index is meant to demonstrate
-        # separation, not to flatter itself.
-        step = 24 + (index * 7) % 40
-
-        for offset in range(0, SIZE[0] * 2, step):
-            draw.line(
-                [(offset, 0), (offset - SIZE[1], SIZE[1])],
-                fill=tuple(min(255, channel + 60) for channel in scenario["colour"]),
-                width=3 + index % 4,
+        for _ in range(8 + index):
+            x0, y0 = rng.randrange(SIZE[0]), rng.randrange(SIZE[1])
+            draw.ellipse(
+                [x0, y0, x0 + rng.randrange(40, 160), y0 + rng.randrange(40, 160)],
+                outline=tuple(min(255, channel + 90) for channel in scenario["colour"]),
+                width=2 + index % 4,
             )
 
         draw.rectangle([24, 24, SIZE[0] - 24, 120], fill=(250, 250, 250))

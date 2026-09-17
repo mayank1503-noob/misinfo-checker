@@ -363,6 +363,10 @@ class EvidenceGraph:
             demo=bool(item.get("demo")),
             method=item.get("method"),
             similarity=item.get("similarity"),
+            # The retriever's own notes — which image this came from, why
+            # it was matched, the demo warning. Carried through because
+            # the verdict quotes them; `_clean_attrs` strips any vector.
+            meta=item.get("meta") or {},
         )
 
         self.add_edge(claim_id, evidence_id, "HAS_EVIDENCE")
@@ -453,7 +457,15 @@ class EvidenceGraph:
         if first_seen:
             self.add_date(first_seen)
             self.add_edge(image_node, date_id(first_seen), "FIRST_SEEN_ON")
-            self.g.nodes[image_node]["first_seen"] = first_seen
+
+            # "First seen" can only move *earlier*. One picture often
+            # matches several archive entries, and the last one written
+            # is not the oldest — taking it would understate how long the
+            # image has been in circulation, which is the whole finding.
+            known = self.g.nodes[image_node].get("first_seen")
+            self.g.nodes[image_node]["first_seen"] = (
+                min(known, first_seen) if known else first_seen
+            )
 
         return evidence_id
 
@@ -494,7 +506,10 @@ class EvidenceGraph:
             note=note,
         )
 
-        self.g.nodes[image_node]["first_seen"] = first_seen
+        known = self.g.nodes[image_node].get("first_seen")
+        self.g.nodes[image_node]["first_seen"] = (
+            min(known, first_seen) if known else first_seen
+        )
         self.g.nodes[image_node]["date_mismatch"] = True
 
         return first_seen

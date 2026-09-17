@@ -49,9 +49,14 @@ DEFAULT_INDEX_PATH = os.path.join(ROOT, "data", "image_index.json")
 
 METADATA_NAME = "metadata.jsonl"
 
-# DINOv2 cosine for the same picture (re-encoded, re-cropped, recompressed)
-# stays high; different photographs of the same event sit well below this.
-SIMILARITY_FLOOR = 0.90
+# DINOv2 cosine for the same picture stays very high even after it has
+# been recompressed on its way through three chat apps: measured at 0.98
+# for a JPEG re-encode at quality 70. Distinct images - even synthetic
+# ones built to look alike - peak around 0.92. The floor sits in that
+# gap, and is deliberately nearer the top of it: a missed match costs one
+# finding, while a false match tells someone a real photograph is
+# recycled, which is the more expensive mistake.
+SIMILARITY_FLOOR = 0.95
 
 TOP_K = 3
 

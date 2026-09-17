@@ -263,13 +263,15 @@ def _check_index(graph, image, image_node, claim_ids, floor, report):
                     first_seen=first_seen,
                     context=match.get("context"),
                 )
-
-                if graph.flag_date_mismatch(image_node, first_seen):
-                    report["date_mismatches"] += 1
             except Exception as error:               # fail soft, never raise
                 message = f"could not link {evidence_id}: {type(error).__name__}: {error}"
                 log.warning(message)
                 report["errors"].append(message)
+
+    # One picture, one date-mismatch finding, using the *earliest* match.
+    # A picture that matches three archive entries has not been recycled
+    # three times, and the oldest appearance is the one that matters.
+    _flag_earliest(graph, image_node, [m.get("first_seen") for m in matches], report)
 
 
 def _check_reverse(graph, image, image_node, claim_ids, report):
@@ -308,8 +310,33 @@ def _check_reverse(graph, image, image_node, claim_ids, report):
             except Exception as error:               # fail soft, never raise
                 report["errors"].append(str(error))
 
-        if earliest and graph.flag_date_mismatch(image_node, earliest):
-            report["date_mismatches"] += 1
+        _flag_earliest(graph, image_node, [earliest], report)
+
+
+def _flag_earliest(graph, image_node, dates, report):
+    """
+    Flag one image as recycled, once, from the oldest date found for it.
+
+    Counted per image rather than per match, so the report says how many
+    pictures are recycled rather than how many archive entries they hit.
+    """
+    known = [date for date in dates if date]
+
+    if not known:
+        return
+
+    already = bool((graph.node(image_node) or {}).get("date_mismatch"))
+
+    try:
+        flagged = graph.flag_date_mismatch(image_node, min(known))
+    except Exception as error:                       # fail soft, never raise
+        message = f"could not flag a date mismatch: {type(error).__name__}: {error}"
+        log.warning(message)
+        report["errors"].append(message)
+        return
+
+    if flagged and not already:
+        report["date_mismatches"] += 1
 
 
 def _check_consistency(graph, image, image_node, claim_ids, threshold, report):

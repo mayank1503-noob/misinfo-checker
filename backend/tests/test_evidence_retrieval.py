@@ -883,8 +883,10 @@ def test_retrieve_for_claim_returns_normalised_candidates(stub_retrievers):
 # --- the cache --------------------------------------------------------------
 
 
-def test_http_responses_are_cached(monkeypatch):
+def test_http_responses_are_cached(monkeypatch, real_http):
     from backend.common import http
+
+    monkeypatch.setattr(http, "get_json", real_http["get_json"])
 
     calls = []
 
@@ -909,8 +911,10 @@ def test_http_responses_are_cached(monkeypatch):
     assert len(calls) == 1                  # the second call never left the process
 
 
-def test_failures_are_not_cached(monkeypatch):
+def test_failures_are_not_cached(monkeypatch, real_http):
     from backend.common import http
+
+    monkeypatch.setattr(http, "get_json", real_http["get_json"])
 
     attempts = []
 
