@@ -142,9 +142,12 @@ and `STANCE_TESTS_WITH_MODELS=1`.
   system interpreter.
 - `backend/analyzers/video.py` still uses `tempfile.mktemp` and never cleans up keyframe
   directories or downloaded videos.
-- `backend/analyzers/models.py` loads BLIP through the `image-text-to-text` pipeline
-  task; that checkpoint is normally loaded with `image-to-text`. Untested here — the
-  image tests supply descriptions directly.
+- ~~`backend/analyzers/models.py` loads BLIP through the `image-text-to-text` pipeline
+  task~~ **Resolved.** The task name was right — `image-to-text` no longer exists in
+  transformers 5 — but the *call* was not: that pipeline refuses an image on its own
+  (`ValueError: You must provide text for this pipeline`), so `image.describe()` raised
+  on every image it was ever given. It now passes the empty prompt BLIP captions
+  unconditionally with. Verified against the real checkpoint. See DECISIONS.md O5.
 - `backend/evaluation/` is built: 41 labelled cases in `data/eval_cases.jsonl`, a runner
   with three modes (`claims` / `retrieval` / `full`), metrics that keep wrong accusations
   separate from missed rumours and in-corpus cases separate from out-of-corpus ones, a

@@ -551,3 +551,20 @@ it as a logic bug.
 `models.py` loads BLIP through the `image-text-to-text` task when that
 checkpoint normally wants `image-to-text`; `venv/` is broken. All predate this work and sit in stage
 1, which the brief said not to modify.
+
+**Update — the BLIP half was a live defect, and is fixed.** The note above had
+the diagnosis backwards. `image-to-text` is gone in transformers 5 (the installed
+version is 5.15): `image-text-to-text` is the only captioning task left, so the
+task name was already the right one. What was wrong was the call. That pipeline
+is built for prompted vision-language models and raises on an image alone —
+
+    >>> models.blip()(image)
+    ValueError: You must provide text for this pipeline
+
+— which means `describe()` raised for *every* image, and the image tests never
+caught it because they supply descriptions directly. `describe()` now passes
+`text=""`, the empty prompt BLIP takes for an unconditional caption. Measured
+against the real checkpoint: a plain image now returns a caption ("a green
+screen with a white background") where it previously raised. The empty prompt is
+also why `generated_text` needs no stripping — with a non-empty prompt the
+pipeline prefixes the caption with it.

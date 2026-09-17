@@ -555,11 +555,25 @@ POST /check/packet    a packet built elsewhere
 ```
 
 **Flask** (`backend/api/flask_app.py`) — what the browser talks to. Same endpoints under
-`/api`, and it serves `frontend/index.html` itself, which is why there is no CORS
-configuration anywhere in the project: the page and the API are one origin.
+`/api`, and it serves the page itself, which is why there is no CORS configuration
+anywhere in the project: the page and the API are one origin.
+
+`GET /` is a Jinja template (`backend/api/templates/index.html`), not the built
+`frontend/index.html` handed over as a file. The template is the SPA shell; the server
+fills in two things the page would otherwise have to guess at:
+
+* **the bundle.** Vite writes a content hash into every asset name, so the server reads
+  the names out of the build at render time. A rebuild changes no Python and no template.
+* **`window.__VERILENS__`**, injected before the bundle loads: the API base and the limits
+  the API enforces (`maxTextChars`, `maxUploadBytes`). The page refuses an over-long
+  message or an oversized file itself rather than waiting for a 413, and the numbers live
+  in one place — `flask_app.py` — instead of being copied into JavaScript.
+
+With no bundle in `frontend/`, `/` renders the `npm run build` instructions instead of a
+blank root div; the API stays up either way.
 
 ```
-GET  /                the frontend
+GET  /                the page (rendered template)
 GET  /api/health
 POST /api/check/text      {"text": "..."}          JSON or form
 POST /api/check/link      {"url": "https://..."}
@@ -649,7 +663,9 @@ data/seed_factchecks.jsonl   32 demo fact-checks
 data/seed_images/            8 demo placeholder images + metadata
   evaluation/    dataset.py (the labelled set), runner.py, metrics.py,
                           report.py, __main__.py (the CLI), DATA.md
-frontend/index.html          the UI, served by the Flask app
+web/                         the UI's source (React + Vite); `npm run build`
+frontend/                    the built bundle the Flask app renders into its template
+backend/api/templates/       index.html, the SPA shell Flask renders
 scripts/                     smoke_pipeline.py, smoke_evidence.py, smoke_agents.py,
                              build_image_index.py
 ```
@@ -673,9 +689,20 @@ python -m backend.api.flask_app          # the UI: http://127.0.0.1:5000
 ```
 
 Open http://127.0.0.1:5000 for the frontend — not `frontend/index.html` off disk. Served
-from the Flask app the page and the API share an origin; opened as a `file://` URL the
-page falls back to `http://127.0.0.1:5000/api` and the browser will block it as
+from the Flask app the page and the API share an origin, and the page is handed its
+config; opened as a `file://` URL there is no config and no origin to borrow, so the
+bundle falls back to `http://127.0.0.1:5000/api` and the browser will block it as
 cross-origin.
+
+To change the UI, edit `web/src/` and rebuild — the Flask app picks up the new asset
+names on its own:
+
+```powershell
+cd web
+npm install
+npm run build        # -> ../frontend
+npm run dev          # or :5173, proxying /api to Flask on :5000
+```
 
 Image and video ingest additionally need `easyocr openai-whisper yt-dlp` and `ffmpeg` on
 PATH. `AI_DETECTOR_MODEL=<hf model id>` enables AI-generated-image scoring.
